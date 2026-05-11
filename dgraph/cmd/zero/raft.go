@@ -432,6 +432,10 @@ func (n *node) applyProposal(e raftpb.Entry) (uint64, error) {
 		}
 	}
 	if p.Member != nil {
+		// todo
+		if p.Member.Addr == "localhost:7080" {
+			p.Member.Addr = "buf-net-alpha"
+		}
 		if err := n.handleMemberProposal(p.Member); err != nil {
 			span.AddEvent(fmt.Sprintf("While applying membership proposal: %+v", err))
 			glog.Errorf("While applying membership proposal: %+v", err)
@@ -605,6 +609,10 @@ func (n *node) checkForCIDInEntries() (bool, error) {
 		}
 	}
 	return false, err
+}
+
+func (n *node) InitAndStartNode() error {
+	return n.initAndStartNode()
 }
 
 func (n *node) initAndStartNode() error {

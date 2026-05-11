@@ -50,3 +50,5 @@ x/log_test/*.enc
 .worktrees/
 AGENTS.md
 CLAUDE.md
+embeding_data
+*.prof

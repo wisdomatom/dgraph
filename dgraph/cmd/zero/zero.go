@@ -67,6 +67,21 @@ type Server struct {
 	pb.UnimplementedZeroServer
 }
 
+func NewServer(nd *conn.Node, closer *z.Closer) *Server {
+	opts.limiterConfig = &x.LimiterConf{}
+	opts.rebalanceInterval = time.Hour
+	s := &Server{}
+	s.Node = &node{
+		Node:       nd,
+		server:     s,
+		lastQuorum: time.Now(),
+		ctx:        closer.Ctx(),
+		closer:     closer,
+	}
+
+	return s
+}
+
 // Init initializes the zero server.
 func (s *Server) Init() {
 	s.Lock()
@@ -501,6 +516,9 @@ func (s *Server) RemoveNode(ctx context.Context, req *pb.RemoveNodeRequest) (*pb
 func (s *Server) Connect(ctx context.Context,
 	m *pb.Member) (resp *pb.ConnectionState, err error) {
 	// Ensures that connect requests are always serialized
+	if m.Addr == "localhost:7080" {
+		m.Addr = "buf-net-alpha"
+	}
 	s.connectLock.Lock()
 	defer s.connectLock.Unlock()
 	glog.Infof("Got connection request: %+v\n", m)

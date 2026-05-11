@@ -590,11 +590,15 @@ func (s *Server) doMutate(ctx context.Context, qc *queryContext, resp *api.Respo
 		return err
 	}
 
-	qc.span.AddEvent("Applying mutations",
-		trace.WithAttributes(attribute.String("m", fmt.Sprintf("%+v", m))))
+	/*
+		qc.span.AddEvent("Applying mutations",
+			trace.WithAttributes(attribute.String("m", fmt.Sprintf("%+v", m))))
+	*/
 	resp.Txn, err = query.ApplyMutations(ctx, m)
-	qc.span.AddEvent("Txn Context",
-		trace.WithAttributes(attribute.String("txn", fmt.Sprintf("%+v", resp.Txn))))
+	/*
+		qc.span.AddEvent("Txn Context",
+			trace.WithAttributes(attribute.String("txn", fmt.Sprintf("%+v", resp.Txn))))
+	*/
 	if err != nil {
 		qc.span.AddEvent("Error",
 			trace.WithAttributes(attribute.String("err", err.Error())))
@@ -2211,6 +2215,12 @@ func verifyUniqueWithinMutation(qc *queryContext) error {
 		return nil
 	}
 
+	type uniqueKey struct {
+		pred string
+		val  interface{}
+	}
+	seen := make(map[uniqueKey]string)
+
 	for i := range qc.uniqueVars {
 		gmuIndex, rdfIndex := decodeIndex(i)
 		// handles cases where the mutation was pruned in updateMutations
@@ -2219,22 +2229,18 @@ func verifyUniqueWithinMutation(qc *queryContext) error {
 		}
 		pred1 := qc.gmuList[gmuIndex].Set[rdfIndex]
 		pred1Value := dql.TypeValFrom(pred1.ObjectValue).Value
-		for j := range qc.uniqueVars {
-			if i == j {
-				continue
-			}
-			gmuIndex2, rdfIndex2 := decodeIndex(j)
-			// check for the second predicate, which could also have been pruned
-			if gmuIndex2 >= uint32(len(qc.gmuList)) || qc.gmuList[gmuIndex2] == nil || rdfIndex2 >= uint32(len(qc.gmuList[gmuIndex2].Set)) {
-				continue
-			}
-			pred2 := qc.gmuList[gmuIndex2].Set[rdfIndex2]
-			if pred2.Predicate == pred1.Predicate && dql.TypeValFrom(pred2.ObjectValue).Value == pred1Value &&
-				pred2.Subject != pred1.Subject {
+		if b, ok := pred1Value.([]byte); ok {
+			pred1Value = string(b)
+		}
+
+		key := uniqueKey{pred: pred1.Predicate, val: pred1Value}
+		if sub, ok := seen[key]; ok {
+			if sub != pred1.Subject {
 				return errors.Errorf("could not insert duplicate value [%v] for predicate [%v]",
 					pred1Value, pred1.Predicate)
 			}
 		}
+		seen[key] = pred1.Subject
 	}
 	return nil
 }

@@ -1,0 +1,101 @@
+下面是我graphql-dgraph项目里的一个测试用例，同样的数据写入场景，同样的资源（4c8g），mysql可以做到90000tps，dgraph却只能跑到20000tps。
+// TestBenchmarkDgraphRawDQLBatch 模拟原生 DQL 批量写入压测 (绕过 GraphQL 翻译层)
+func TestBenchmarkDgraphRawDQLBatch(t *testing.T) {
+	if ed == nil {
+		t.Skip("Embedded Dgraph not initialized")
+	}
+	ctx := WithAdminContext(context.TODO())
+	// 依然需要初始化 Schema 以确保索引存在，否则 TPS 没有对比意义
+	dsl := `
+		TestUser {
+			name @type(string) @index(hash)
+			email @type(string) @index(exact) @uni @uniNm(primary)
+			birthday @type(datetime)
+			sex @type(bool)
+			avatar @type(string)
+			hobby @type([]string)
+		}
+	`
+	schema := initSchema(t, dsl)
+
+	dg, _ := GetDgraphClient(NamespaceDefault)
+
+	concurrency := 20
+	batchSize := 1000
+	totalRows := 100000
+	var successCount int64
+	var wg sync.WaitGroup
+
+	fmt.Printf("开始 Dgraph 原生 DQL 批量压测: 并发=%d, 批次大小=%d, 目标=%d\n", concurrency, batchSize, totalRows)
+	startTime := time.Now()
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			batchesPerWorker := (totalRows / concurrency) / batchSize
+
+			for b := 0; b < batchesPerWorker; b++ {
+				var mutations []*api.Mutation
+				for j := 0; j < batchSize; j++ {
+					uid := fmt.Sprintf("_:id%d", j)
+					email := fmt.Sprintf("raw_%d_%d_%d@bench.com", workerID, b, j)
+
+					// 模拟项目翻译出的 DQL 结构：拆分为多个 Mutation 块
+					// 1. 数据主体
+					data, _ := json.Marshal(map[string]interface{}{
+						"uid":               uid,
+						"TestUser.name":     "tom_batch",
+						"TestUser.email":    email,
+						"TestUser.birthday": "1990-01-01T00:00:00Z",
+						"TestUser.sex":      true,
+						"TestUser.avatar":   "http://avatar.png",
+						"TestUser.hobby":    []string{"ping-pong", "tennis", "basketball"},
+
+						"_TestUser":   true,
+						"dgraph.type": "TestUser",
+					})
+					mutations = append(mutations, &api.Mutation{SetJson: data})
+
+					// 2. 类型标记
+					//typeTag, _ := json.Marshal(map[string]interface{}{
+					//	"uid":         uid,
+					//	"_User":       true,
+					//	"dgraph.type": "User",
+					//})
+					//mutations = append(mutations, &api.Mutation{SetJson: typeTag})
+				}
+
+				req := &api.Request{
+					CommitNow: true,
+					Mutations: mutations,
+				}
+
+				_, err := dg.NewTxn().Do(ctx, req)
+				if err == nil {
+					atomic.AddInt64(&successCount, int64(batchSize))
+				} else {
+					fmt.Printf("raw dql error: %v\n", err)
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+	duration := time.Since(startTime)
+	fmt.Printf("\n--- Dgraph 原生 DQL 批量写入报告 ---\n总耗时: %v, TPS (Rows/sec): %.2f\n", duration, float64(successCount)/duration.Seconds())
+	res := graphqlDo(ctx, *schema, `{countTestUsers}`, nil)
+	assert.False(t, res.HasErrors())
+	fmt.Println("count:", res.Data)
+}
+
+上面测试用例里的TestUser模型，翻译成dgraph的predicate定义如下：
+TestUser.hobby: [string]   .
+_TestUser: bool @index(bool)  .
+TestUser.name: string @index(hash)  .
+TestUser.email: string @index(exact) @upsert .
+TestUser.birthday: datetime   .
+TestUser.sex: bool   .
+TestUser.avatar: string   .
+
+dgraph使用lsm的列式数据库，写入性能应该不会比b+树还差，到底是哪里出了问题？
+你可以帮我分析下吗？可以再写一个测试用例，结合pprof输出信息，协助定位性能问题。
