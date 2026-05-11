@@ -280,7 +280,7 @@ func RunBulkLoader(opt BulkOptions) {
 	maxOpenFilesWarning()
 
 	go func() {
-		log.Fatal(http.ListenAndServe(opt.HttpAddr, nil))
+		log.Fatal(http.ListenAndServe(opt.HttpAddr, x.SanitizedDefaultServeMux()))
 	}()
 	http.HandleFunc("/jemalloc", x.JemallocHandler)
 

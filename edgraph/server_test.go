@@ -285,4 +285,200 @@ func TestVerifyUniqueWithinMutationBoundsChecks(t *testing.T) {
 		err := verifyUniqueWithinMutation(qc)
 		require.NoError(t, err)
 	})
+
+	// Regression test for https://github.com/dgraph-io/dgraph/issues/9670
+	// When an NQuad has a nil ObjectValue (e.g. a UID edge on a predicate
+	// marked @unique), verifyUniqueWithinMutation would panic with a nil
+	// pointer dereference in dql.TypeValFrom.
+	t.Run("nil ObjectValue should not panic", func(t *testing.T) {
+		qc := &queryContext{
+			gmuList: []*dql.Mutation{
+				{
+					Set: []*api.NQuad{
+						{
+							Subject:     "_:a",
+							Predicate:   "friend",
+							ObjectId:    "0x1",
+							ObjectValue: nil, // UID edge, no value
+						},
+					},
+				},
+			},
+			uniqueVars: map[uint64]uniquePredMeta{
+				encodeIndex(0, 0): {},
+			},
+		}
+		// Before fix: panics with "nil pointer dereference" in dql.TypeValFrom
+		require.NotPanics(t, func() {
+			_ = verifyUniqueWithinMutation(qc)
+		})
+	})
+
+	// Same issue but with two NQuads where one has a nil ObjectValue
+	// and the other has a real value — the inner loop comparison must
+	// also handle the nil case.
+	t.Run("nil ObjectValue mixed with value NQuad should not panic", func(t *testing.T) {
+		qc := &queryContext{
+			gmuList: []*dql.Mutation{
+				{
+					Set: []*api.NQuad{
+						{
+							Subject:   "_:a",
+							Predicate: "email",
+							ObjectValue: &api.Value{
+								Val: &api.Value_StrVal{StrVal: "test@example.com"},
+							},
+						},
+						{
+							Subject:     "_:a",
+							Predicate:   "friend",
+							ObjectId:    "0x2",
+							ObjectValue: nil, // UID edge
+						},
+					},
+				},
+			},
+			uniqueVars: map[uint64]uniquePredMeta{
+				encodeIndex(0, 0): {},
+				encodeIndex(0, 1): {},
+			},
+		}
+		require.NotPanics(t, func() {
+			err := verifyUniqueWithinMutation(qc)
+			require.NoError(t, err)
+		})
+	})
+
+	// Verify that val(...) reference edges (ObjectId="val(x)", ObjectValue=nil)
+	// don't panic. These go through a different code path in addQueryIfUnique
+	// but could still appear in uniqueVars and be iterated by
+	// verifyUniqueWithinMutation.
+	t.Run("val() reference with nil ObjectValue should not panic", func(t *testing.T) {
+		qc := &queryContext{
+			gmuList: []*dql.Mutation{
+				{
+					Set: []*api.NQuad{
+						{
+							Subject:     "_:a",
+							Predicate:   "email",
+							ObjectId:    "val(queryVar)",
+							ObjectValue: nil,
+						},
+					},
+				},
+			},
+			uniqueVars: map[uint64]uniquePredMeta{
+				encodeIndex(0, 0): {},
+			},
+		}
+		require.NotPanics(t, func() {
+			_ = verifyUniqueWithinMutation(qc)
+		})
+	})
+}
+
+func TestValidateCondValue(t *testing.T) {
+	// Valid conditions that should pass.
+	valid := []string{
+		``,
+		`@if(eq(len(v), 0))`,
+		` @if(eq(len(v), 0)) `,
+		`@if(eq(name, "Alice"))`,
+		`@if(le(len(c1), 100) AND lt(len(c2), 100))`,
+		`@if(not(eq(len(v), 0)))`,
+		`@if(eq(name, "has (parens) inside"))`,
+		`@filter(eq(len(v), 0))`,
+		// Spaces between directive and opening paren should be allowed (issue #9687).
+		`@if (eq(len(v), 0))`,
+		`@if  (eq(len(v), 0))`,
+		`@filter (eq(len(v), 0))`,
+		` @if ( NOT eq(len(RoutesId), 0) ) `,
+	}
+	for _, c := range valid {
+		require.NoError(t, validateCondValue(c), "expected valid: %q", c)
+	}
+
+	// Invalid conditions that should be rejected.
+	invalid := []struct {
+		cond string
+		desc string
+	}{
+		{
+			cond: "@if(eq(name, \"x\"))\n  leak(func: has(dgraph.type)) { uid }",
+			desc: "DQL injection via newline and extra query block",
+		},
+		{
+			cond: "@if(eq(name, \"x\")) } leak(func: uid(0x1)) { uid",
+			desc: "DQL injection closing brace then new block",
+		},
+		{
+			cond: "eq(name, \"x\")",
+			desc: "missing @if/@filter prefix",
+		},
+		{
+			cond: "@if(eq(name, \"x\")",
+			desc: "unbalanced parentheses",
+		},
+		{
+			cond: "@if(eq(name, \"x\")) extra",
+			desc: "trailing content after condition",
+		},
+	}
+	for _, tc := range invalid {
+		require.Error(t, validateCondValue(tc.cond), "expected invalid (%s): %q", tc.desc, tc.cond)
+	}
+}
+
+func TestValidateValObjectId(t *testing.T) {
+	valid := []string{
+		"val(v)",
+		"val(queryVariable)",
+		"val(my_var_123)",
+		"val(Amt)",
+		// Leading/trailing whitespace should be tolerated.
+		" val(v)",
+		"val(v) ",
+		" val(v) ",
+	}
+	for _, v := range valid {
+		require.NoError(t, validateValObjectId(v), "expected valid: %q", v)
+	}
+
+	invalid := []string{
+		"val(v)}\nleak(func: has(dgraph.type)) { uid }",
+		"val()",
+		"val(123)",
+		"val(v) extra",
+		"notval(v)",
+	}
+	for _, v := range invalid {
+		require.Error(t, validateValObjectId(v), "expected invalid: %q", v)
+	}
+}
+
+func TestValidateLangTag(t *testing.T) {
+	valid := []string{
+		"",
+		"en",
+		"fr",
+		"zh-Hans",
+		"en-US",
+		// Leading/trailing whitespace should be tolerated.
+		" en",
+		"en ",
+		" en ",
+	}
+	for _, v := range valid {
+		require.NoError(t, validateLangTag(v), "expected valid: %q", v)
+	}
+
+	invalid := []string{
+		"en)}\nleak(func: has(dgraph.type)) { uid }",
+		"en )",
+		"@en",
+		"en;drop",
+	}
+	for _, v := range invalid {
+		require.Error(t, validateLangTag(v), "expected invalid: %q", v)
+	}
 }

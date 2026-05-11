@@ -503,6 +503,7 @@ var (
 		"export":          stdAdminMutMWs, // dgraph handles the export for other namespaces by superadmin
 		"login":           minimalAdminMutMWs,
 		"restore":         gogMutMWs,
+		"restoreTenant":   gogMutMWs,
 		"shutdown":        gogMutMWs,
 		"removeNode":      gogMutMWs,
 		"moveTablet":      gogMutMWs,

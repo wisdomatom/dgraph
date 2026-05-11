@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -713,11 +714,116 @@ func validateMutation(ctx context.Context, edges []*pb.DirectedEdge) error {
 	return nil
 }
 
+// validateCondValue checks that a cond string is a well-formed @if(...) or @filter(...)
+// clause with balanced parentheses and no trailing content. This prevents DQL injection
+// via crafted cond values that close the parenthesized expression and append additional
+// query blocks.
+func validateCondValue(cond string) error {
+	cond = strings.TrimSpace(cond)
+	if cond == "" {
+		return nil
+	}
+
+	lower := strings.ToLower(cond)
+	if !strings.HasPrefix(lower, "@if") && !strings.HasPrefix(lower, "@filter") {
+		return errors.Errorf("invalid cond value: must start with @if( or @filter(")
+	}
+
+	// Strip the directive prefix and verify the remainder (after optional whitespace) starts with '('.
+	prefix := "@if"
+	if strings.HasPrefix(lower, "@filter") {
+		prefix = "@filter"
+	}
+	rest := strings.TrimSpace(cond[len(prefix):])
+	if len(rest) == 0 || rest[0] != '(' {
+		return errors.Errorf("invalid cond value: must start with @if( or @filter(")
+	}
+	// Rebuild cond without the space so the paren-balancing logic works on the normalized form.
+	cond = prefix + rest
+
+	openIdx := strings.Index(cond, "(")
+	if openIdx == -1 {
+		return errors.Errorf("invalid cond value: missing opening parenthesis")
+	}
+
+	depth := 0
+	inString := false
+	escaped := false
+	closingIdx := -1
+
+	for i := openIdx; i < len(cond); i++ {
+		ch := cond[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if ch == '\\' {
+			escaped = true
+			continue
+		}
+		if ch == '"' {
+			inString = !inString
+			continue
+		}
+		if inString {
+			continue
+		}
+		if ch == '(' {
+			depth++
+		} else if ch == ')' {
+			depth--
+			if depth == 0 {
+				closingIdx = i
+				break
+			}
+		}
+	}
+
+	if closingIdx == -1 {
+		return errors.Errorf("invalid cond value: unbalanced parentheses")
+	}
+
+	trailing := strings.TrimSpace(cond[closingIdx+1:])
+	if trailing != "" {
+		return errors.Errorf("invalid cond value: unexpected content after condition")
+	}
+
+	return nil
+}
+
+// valVarRegexp matches a valid val(variableName) reference used in upsert mutations.
+var valVarRegexp = regexp.MustCompile(`^val\([a-zA-Z_][a-zA-Z0-9_.]*\)$`)
+
+// validateValObjectId checks that an ObjectId starting with "val(" is a well-formed
+// val(variableName) reference and contains no injected DQL syntax.
+func validateValObjectId(objectId string) error {
+	objectId = strings.TrimSpace(objectId)
+	if !valVarRegexp.MatchString(objectId) {
+		return errors.Errorf("invalid val() reference in ObjectId: %q", objectId)
+	}
+	return nil
+}
+
+// langTagRegexp matches a valid BCP 47 language tag (letters, digits, hyphens).
+var langTagRegexp = regexp.MustCompile(`^[a-zA-Z]+(-[a-zA-Z0-9]+)*$`)
+
+// validateLangTag checks that a language tag contains only safe characters.
+func validateLangTag(lang string) error {
+	lang = strings.TrimSpace(lang)
+	if lang == "" {
+		return nil
+	}
+	if !langTagRegexp.MatchString(lang) {
+		return errors.Errorf("invalid language tag: %q", lang)
+	}
+	return nil
+}
+
 // buildUpsertQuery modifies the query to evaluate the
 // @if condition defined in Conditional Upsert.
-func buildUpsertQuery(qc *queryContext) string {
+func buildUpsertQuery(qc *queryContext) (string, error) {
 	if qc.req.Query == "" || len(qc.gmuList) == 0 {
-		return qc.req.Query
+		return qc.req.Query, nil
 	}
 
 	qc.condVars = make([]string, len(qc.req.Mutations))
@@ -728,6 +834,10 @@ func buildUpsertQuery(qc *queryContext) string {
 	for i, gmu := range qc.gmuList {
 		isCondUpsert := strings.TrimSpace(gmu.Cond) != ""
 		if isCondUpsert {
+			if err := validateCondValue(gmu.Cond); err != nil {
+				return "", err
+			}
+
 			qc.condVars[i] = fmt.Sprintf("__dgraph_upsertcheck_%v__", strconv.Itoa(i))
 			qc.uidRes[qc.condVars[i]] = nil
 			// @if in upsert is same as @filter in the query
@@ -757,7 +867,7 @@ func buildUpsertQuery(qc *queryContext) string {
 	}
 
 	x.Check2(upsertQB.WriteString(`}`))
-	return upsertQB.String()
+	return upsertQB.String(), nil
 }
 
 // updateMutations updates the mutation and replaces uid(var) and val(var) with
@@ -1585,7 +1695,11 @@ func parseRequest(ctx context.Context, qc *queryContext) error {
 
 		qc.uidRes = make(map[string][]string)
 		qc.valRes = make(map[string]*types.ShardedMap)
-		upsertQuery = buildUpsertQuery(qc)
+		var err error
+		upsertQuery, err = buildUpsertQuery(qc)
+		if err != nil {
+			return err
+		}
 		needVars = findMutationVars(qc)
 		if upsertQuery == "" {
 			if len(needVars) > 0 {
@@ -1781,6 +1895,9 @@ func addQueryIfUnique(qctx context.Context, qc *queryContext) error {
 			// during the automatic serialization of a structure into JSON.
 			predicateName := fmt.Sprintf("<%v>", pred.Predicate)
 			if pred.Lang != "" {
+				if err := validateLangTag(pred.Lang); err != nil {
+					return err
+				}
 				predicateName = fmt.Sprintf("%v@%v", predicateName, pred.Lang)
 			}
 
@@ -1808,6 +1925,9 @@ func addQueryIfUnique(qctx context.Context, qc *queryContext) error {
 			// in the mutation, then we reject the mutation.
 
 			if !strings.HasPrefix(pred.ObjectId, "val(") {
+				if pred.ObjectValue == nil {
+					continue
+				}
 				val := strconv.Quote(fmt.Sprintf("%v", dql.TypeValFrom(pred.ObjectValue).Value))
 				query := fmt.Sprintf(`%v as var(func: eq(%v,"%v"))`, queryVar, predicateName, val[1:len(val)-1])
 				if _, err := buildQuery.WriteString(query); err != nil {
@@ -1815,6 +1935,9 @@ func addQueryIfUnique(qctx context.Context, qc *queryContext) error {
 				}
 				qc.uniqueVars[uniqueVarMapKey] = uniquePredMeta{queryVar: queryVar}
 			} else {
+				if err := validateValObjectId(pred.ObjectId); err != nil {
+					return err
+				}
 				valQueryVar := fmt.Sprintf("__dgraph_uniquecheck_val_%v__", uniqueVarMapKey)
 				query := fmt.Sprintf(`%v as var(func: eq(%v,%v)){
 					                             uid
@@ -2228,6 +2351,9 @@ func verifyUniqueWithinMutation(qc *queryContext) error {
 			continue
 		}
 		pred1 := qc.gmuList[gmuIndex].Set[rdfIndex]
+		if pred1.ObjectValue == nil {
+			continue
+		}
 		pred1Value := dql.TypeValFrom(pred1.ObjectValue).Value
 		if b, ok := pred1Value.([]byte); ok {
 			pred1Value = string(b)

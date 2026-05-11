@@ -620,7 +620,8 @@ func setupServer(closer *z.Closer, enableMcp bool) {
 		}
 	}
 
-	go x.StartListenHttpAndHttps(httpListener, tlsCfg, x.ServerCloser)
+	serverHandler := x.SanitizedDefaultServeMux()
+	go x.StartListenHttpAndHttps(httpListener, tlsCfg, x.ServerCloser, serverHandler)
 
 	go func() {
 		defer x.ServerCloser.Done()

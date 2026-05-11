@@ -131,7 +131,7 @@ func lexContent(l *lex.Lexer, leftRune, rightRune rune, returnTo lex.StateFn) le
 			return l.Errorf("Matching brackets not found")
 		case quote:
 			if err := l.LexQuotedString(); err != nil {
-				return l.Errorf(err.Error())
+				return l.Errorf("%s", err.Error())
 			}
 		case leftRune:
 			depth++
@@ -291,7 +291,7 @@ func lexFuncOrArg(l *lex.Lexer) lex.StateFn {
 			{
 				empty = false
 				if err := l.LexQuotedString(); err != nil {
-					return l.Errorf(err.Error())
+					return l.Errorf("%s", err.Error())
 				}
 				l.Emit(itemName)
 			}
@@ -388,6 +388,9 @@ func lexIdentifyMutationOrQuery(l *lex.Lexer) lex.StateFn {
 			// else it is a query
 			l.Emit(itemName)
 			return lexQuery
+		case r == lsThan:
+			l.Backup()
+			return lexQuery
 		case r == '#':
 			return lexComment
 		case r == lex.EOF:
@@ -449,7 +452,7 @@ func lexQuery(l *lex.Lexer) lex.StateFn {
 
 func lexIRIRef(l *lex.Lexer) lex.StateFn {
 	if err := lex.IRIRef(l, itemName); err != nil {
-		return l.Errorf(err.Error())
+		return l.Errorf("%s", err.Error())
 	}
 	return l.Mode
 }

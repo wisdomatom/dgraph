@@ -160,18 +160,18 @@ func flatInMemListWriteMutation(test flatInMemListAddMutationTest, t *testing.T)
 	// should not modify db [test.startTs, test.finishTs)
 	if string(tsDbs[test.finishTs-1].inMemTestDb[test.key]) != string(tsDbs[test.startTs].inMemTestDb[test.key]) {
 		t.Errorf(
-			"Database at time %q not equal to expected database at time %q. Expected: %q, Got: %q",
+			"Database at time %d not equal to expected database at time %d. Expected: %q, Got: %q",
 			test.finishTs-1, test.startTs,
 			tsDbs[test.startTs].inMemTestDb[test.key],
 			tsDbs[test.finishTs-1].inMemTestDb[test.key])
 	}
 	if string(tsDbs[test.finishTs].inMemTestDb[test.key][:]) != string(test.t.Value[:]) {
-		t.Errorf("The database at time %q for key %q gave value  of %q instead of %q", test.finishTs,
+		t.Errorf("The database at time %d for key %q gave value  of %q instead of %q", test.finishTs,
 			test.key, string(tsDbs[test.finishTs].inMemTestDb[test.key][:]), string(test.t.Value[:]))
 	}
 	if string(tsDbs[test.finishTs].inMemTestDb[test.key][:]) !=
 		string(tsDbs[99].inMemTestDb[test.key][:]) {
-		t.Errorf("The database at time %q for key %q gave value  of %q instead of %q", test.finishTs,
+		t.Errorf("The database at time %d for key %q gave value  of %q instead of %q", test.finishTs,
 			test.key, string(tsDbs[99].inMemTestDb[test.key][:]),
 			string(tsDbs[test.finishTs].inMemTestDb[test.key][:]))
 	}
@@ -232,11 +232,11 @@ func TestFlatInMemListAddMultipleWritesMutation(t *testing.T) {
 		} else {
 			if string(tsDbs[test.finishTs-1].inMemTestDb[test.key][:]) !=
 				string(flatInMemListAddMultipleWritesMutationTests[test.currIteration-1].t.Value[:]) {
-				t.Errorf("The database at time %q for key %q gave value  of %q instead of %q", test.finishTs,
+				t.Errorf("The database at time %d for key %q gave value  of %q instead of %q", test.finishTs,
 					test.key, string(tsDbs[test.finishTs].inMemTestDb[test.key][:]), string(test.t.Value[:]))
 			}
 			if string(tsDbs[test.finishTs].inMemTestDb[test.key][:]) != string(test.t.Value[:]) {
-				t.Errorf("The database at time %q for key %q gave value  of %q instead of %q", test.finishTs,
+				t.Errorf("The database at time %d for key %q gave value  of %q instead of %q", test.finishTs,
 					test.key, string(tsDbs[test.finishTs].inMemTestDb[test.key][:]), string(test.t.Value[:]))
 			}
 		}
@@ -357,7 +357,7 @@ func TestFlatEntryInsertToPersistentFlatStorage(t *testing.T) {
 		entryKey := DataKey(ConcatStrings(flatPh.pred, VecEntry), 1)
 		entryVal := BytesToUint64(tsDbs[99].inMemTestDb[string(entryKey[:])])
 		if entryVal != test.inUuid {
-			t.Errorf("entry value stored is incorrect. Expected: %q, Got: %q", test.inUuid, entryVal)
+			t.Errorf("entry value stored is incorrect. Expected: %d, Got: %d", test.inUuid, entryVal)
 		}
 	}
 }
@@ -418,7 +418,7 @@ func TestNonflatEntryInsertToPersistentFlatStorage(t *testing.T) {
 		entryKey := DataKey(ConcatStrings(flatPh.pred, VecEntry), 1)
 		entryVal := BytesToUint64(tsDbs[99].inMemTestDb[string(entryKey[:])])
 		if entryVal != 5 {
-			t.Errorf("entry value stored is incorrect. Expected: %q, Got: %q", 5, entryVal)
+			t.Errorf("entry value stored is incorrect. Expected: %d, Got: %d", 5, entryVal)
 		}
 		for i := range tsDbs {
 			key := DataKey(flatPh.pred, test.inUuid)
@@ -449,6 +449,87 @@ func TestNonflatEntryInsertToPersistentFlatStorage(t *testing.T) {
 		}
 		if !slices.Contains(edgesNameList, test.minExpectedEdge) {
 			t.Errorf("Expected at least %q in list of edges %v", test.minExpectedEdge, edgesNameList)
+		}
+	}
+}
+
+// TestInsertHelper_NoDuplicateNeighborEdges verifies that when the same neighbor
+// UID appears across multiple HNSW layers, insertHelper only produces one
+// addNeighbors call per unique neighbor UID (not one per layer appearance).
+//
+// Before the fix (sp/dedup-neighbor-updates), insertHelper accumulated neighbor
+// UIDs into nnUidArray with duplicates (same UID once per layer it appeared in),
+// causing redundant addNeighbors calls and wasted writes. The fix uses
+// inboundEdgesAllLayersMap (keyed by UID) to deduplicate.
+func TestInsertHelper_NoDuplicateNeighborEdges(t *testing.T) {
+	emptyTsDbs()
+	flatPh := flatPhs[0]
+	flatPh.nodeAllEdges = make(map[uint64][][]uint64)
+
+	// Insert the entry node first.
+	entryInsert := flatEntryInsert
+	key := DataKey(flatPh.pred, entryInsert.inUuid)
+	for i := range tsDbs {
+		tsDbs[i].inMemTestDb[string(key[:])] = floatArrayAsBytes(entryInsert.inVec)
+	}
+	_, err := flatPh.Insert(context.TODO(), entryInsert.tc, entryInsert.inUuid, entryInsert.inVec)
+	if err != nil {
+		t.Fatalf("Failed to insert entry node: %v", err)
+	}
+
+	// Insert a second node so the entry node becomes a neighbor.
+	insert2 := insertToPersistentFlatStorageTest{
+		tc:     NewTxnCache(&inMemTxn{startTs: 12, commitTs: 40}, 12),
+		inUuid: uint64(123),
+		inVec:  []float64{0.824, 0.319, 0.111},
+	}
+	key2 := DataKey(flatPh.pred, insert2.inUuid)
+	for i := range tsDbs {
+		tsDbs[i].inMemTestDb[string(key2[:])] = floatArrayAsBytes(insert2.inVec)
+	}
+	edges2, err := flatPh.Insert(context.TODO(), insert2.tc, insert2.inUuid, insert2.inVec)
+	if err != nil {
+		t.Fatalf("Failed to insert second node: %v", err)
+	}
+
+	// Now insert a third node that should have the previous two as neighbors.
+	insert3 := insertToPersistentFlatStorageTest{
+		tc:     NewTxnCache(&inMemTxn{startTs: 50, commitTs: 60}, 50),
+		inUuid: uint64(456),
+		inVec:  []float64{0.5, 0.3, 0.2},
+	}
+	key3 := DataKey(flatPh.pred, insert3.inUuid)
+	for i := range tsDbs {
+		tsDbs[i].inMemTestDb[string(key3[:])] = floatArrayAsBytes(insert3.inVec)
+	}
+	edges3, err := flatPh.Insert(context.TODO(), insert3.tc, insert3.inUuid, insert3.inVec)
+	if err != nil {
+		t.Fatalf("Failed to insert third node: %v", err)
+	}
+
+	// Count how many times each entity UID appears in the edges list.
+	// With the dedup fix, each neighbor UID should appear at most once
+	// (plus the inserted node itself appears once).
+	edgeEntityCounts := make(map[uint64]int)
+	for _, edge := range edges3 {
+		edgeEntityCounts[edge.Entity]++
+	}
+
+	for uid, count := range edgeEntityCounts {
+		if count > 1 {
+			t.Errorf("Entity UID %d appeared %d times in edges (expected at most 1). "+
+				"This indicates duplicate addNeighbors calls for the same neighbor.", uid, count)
+		}
+	}
+
+	// Also verify edges2 has no duplicates for the same reason.
+	edgeEntityCounts2 := make(map[uint64]int)
+	for _, edge := range edges2 {
+		edgeEntityCounts2[edge.Entity]++
+	}
+	for uid, count := range edgeEntityCounts2 {
+		if count > 1 {
+			t.Errorf("(insert2) Entity UID %d appeared %d times in edges (expected at most 1).", uid, count)
 		}
 	}
 }
