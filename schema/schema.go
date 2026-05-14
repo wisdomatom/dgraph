@@ -18,7 +18,6 @@ import (
 	"golang.org/x/net/trace"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/dgraph-io/badger/v4"
 	badgerpb "github.com/dgraph-io/badger/v4/pb"
 	"github.com/dgraph-io/dgraph/v25/protos/pb"
 	"github.com/dgraph-io/dgraph/v25/tok"
@@ -29,7 +28,7 @@ import (
 
 var (
 	pstate *state
-	pstore *badger.DB
+	pstore x.KVDB
 )
 
 // We maintain two schemas for a predicate if a background task is building indexes
@@ -94,7 +93,7 @@ func (s *state) Delete(attr string, ts uint64) error {
 	defer s.Unlock()
 
 	glog.Infof("Deleting schema for predicate: [%s]", attr)
-	txn := pstore.NewTransactionAt(ts, true)
+	txn := pstore.NewTransaction(math.MaxUint64, true)
 	defer txn.Discard()
 	if err := txn.Delete(x.SchemaKey(attr)); err != nil {
 		return err
@@ -119,7 +118,7 @@ func (s *state) DeleteType(typeName string, ts uint64) error {
 	defer s.Unlock()
 
 	glog.Infof("Deleting type definition for type: [%s]", typeName)
-	txn := pstore.NewTransactionAt(ts, true)
+	txn := pstore.NewTransaction(math.MaxUint64, true)
 	defer txn.Discard()
 	if err := txn.Delete(x.TypeKey(typeName)); err != nil {
 		return err
@@ -522,7 +521,7 @@ func (s *state) IndexingInProgress() bool {
 }
 
 // Init resets the schema state, setting the underlying DB to the given pointer.
-func Init(ps *badger.DB) {
+func Init(ps x.KVDB) {
 	pstore = ps
 	reset()
 }
@@ -534,14 +533,11 @@ func Load(predicate string) error {
 	}
 	State().DeleteMutSchema(predicate)
 	key := x.SchemaKey(predicate)
-	txn := pstore.NewTransactionAt(math.MaxUint64, false)
+	txn := pstore.NewTransaction(math.MaxUint64, false)
 	defer txn.Discard()
 	item, err := txn.Get(key)
-	if err == badger.ErrKeyNotFound || err == badger.ErrBannedKey {
-		return nil
-	}
 	if err != nil {
-		return err
+		return nil
 	}
 	var s pb.SchemaUpdate
 	err = item.Value(func(val []byte) error {
@@ -576,20 +572,20 @@ const (
 
 // loadFromDb iterates through the DB and loads all the stored schema updates.
 func loadFromDB(ctx context.Context, loadType int) error {
-	stream := pstore.NewStreamAt(math.MaxUint64)
+	stream := pstore.NewStream(math.MaxUint64)
 
 	switch loadType {
 	case loadSchema:
-		stream.Prefix = x.SchemaPrefix()
-		stream.LogPrefix = "LoadFromDb Schema"
+		stream.SetPrefix(x.SchemaPrefix())
+		stream.SetLogPrefix("LoadFromDb Schema")
 	case loadType:
-		stream.Prefix = x.TypePrefix()
-		stream.LogPrefix = "LoadFromDb Type"
+		stream.SetPrefix(x.TypePrefix())
+		stream.SetLogPrefix("LoadFromDb Type")
 	default:
 		glog.Fatalf("Invalid load type")
 	}
 
-	stream.KeyToList = func(key []byte, itr *badger.Iterator) (*badgerpb.KVList, error) {
+	stream.SetKeyToList(func(key []byte, itr x.KVStreamIterator) (*badgerpb.KVList, error) {
 		item := itr.Item()
 		pk, err := x.Parse(key)
 		if err != nil {
@@ -629,7 +625,7 @@ func loadFromDB(ctx context.Context, loadType int) error {
 		}
 		glog.Fatalf("Invalid load type")
 		return nil, errors.New("shouldn't reach here")
-	}
+	})
 	return stream.Orchestrate(ctx)
 }
 

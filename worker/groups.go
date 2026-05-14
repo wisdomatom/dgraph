@@ -61,96 +61,32 @@ func groups() *groupi {
 func StartRaftNodes(walStore *raftwal.DiskStorage, bindall bool) {
 	if x.WorkerConfig.MyAddr == "" {
 		x.WorkerConfig.MyAddr = fmt.Sprintf("localhost:%d", workerPort())
-	} else {
-		// check if address is valid or not
-		x.Check(x.ValidateAddress(x.WorkerConfig.MyAddr))
-		if !bindall {
-			glog.Errorln("--my flag is provided without bindall, Did you forget to specify bindall?")
-		}
 	}
 
-	x.AssertTruef(len(x.WorkerConfig.ZeroAddr) > 0, "Providing dgraphzero address is mandatory.")
-	for _, zeroAddr := range x.WorkerConfig.ZeroAddr {
-		x.AssertTruef(zeroAddr != x.WorkerConfig.MyAddr,
-			"Dgraph Zero address %s and Dgraph address (IP:Port) %s can't be the same.",
-			zeroAddr, x.WorkerConfig.MyAddr)
+	glog.Infof("Starting Alpha in Standalone Mode (No Raft/Zero)")
+
+	// Initialize local group state
+	g := groups()
+	g.Lock()
+	g.gid = 1
+	g.state = &pb.MembershipState{
+		Groups: map[uint32]*pb.Group{
+			1: {
+				Members: map[uint64]*pb.Member{
+					1: {Id: 1, GroupId: 1, Addr: x.WorkerConfig.MyAddr},
+				},
+			},
+		},
 	}
-
-	raftIdx := x.WorkerConfig.Raft.GetUint64("idx")
-	if raftIdx == 0 {
-		raftIdx = walStore.Uint(raftwal.RaftId)
-
-		// If the w directory already contains raft information, ignore the proposed
-		// group ID stored inside the p directory.
-		if raftIdx > 0 {
-			x.WorkerConfig.ProposedGroupId = 0
-		}
+	g.Node = &node{
+		Node:   &conn.Node{Id: 1},
+		closer: z.NewCloser(1),
 	}
-	glog.Infof("Current Raft Id: %#x\n", raftIdx)
-
-	if x.WorkerConfig.ProposedGroupId == 0 {
-		x.WorkerConfig.ProposedGroupId = x.WorkerConfig.Raft.GetUint32("group")
-	}
-	// Successfully connect with dgraphzero, before doing anything else.
-	// Connect with Zero leader and figure out what group we should belong to.
-	m := &pb.Member{
-		Id:      raftIdx,
-		GroupId: x.WorkerConfig.ProposedGroupId,
-		Addr:    x.WorkerConfig.MyAddr,
-		Learner: x.WorkerConfig.Raft.GetBool("learner"),
-	}
-	if m.GroupId > 0 {
-		m.ForceGroupId = true
-	}
-	glog.Infof("Sending member request to Zero: %+v\n", m)
-	var connState *pb.ConnectionState
-	var err error
-
-	for { // Keep on retrying. See: https://github.com/dgraph-io/dgraph/issues/2289
-		pl := gr.connToZeroLeader()
-		if pl == nil {
-			continue
-		}
-		zc := pb.NewZeroClient(pl.Get())
-		connState, err = zc.Connect(gr.Ctx(), m)
-		if err == nil || x.ShouldCrash(err) {
-			break
-		}
-	}
-	x.CheckfNoTrace(err)
-	if connState.GetMember() == nil || connState.GetState() == nil {
-		x.Fatalf("Unable to join cluster via dgraphzero")
-	}
-	glog.Infof("Connected to group zero. Assigned group: %+v\n", connState.GetMember().GetGroupId())
-	raftIdx = connState.GetMember().GetId()
-	glog.Infof("Raft Id after connection to Zero: %#x\n", raftIdx)
-
-	// This timestamp would be used for reading during snapshot after bulk load.
-	// The stream is async, we need this information before we start or else replica might
-	// not get any data.
-	gr.applyState(raftIdx, connState.GetState())
-
-	gid := gr.groupId()
-	gr.triggerCh = make(chan struct{}, 1)
-
-	// Initialize DiskStorage and pass it along.
-	walStore.SetUint(raftwal.RaftId, raftIdx)
-	walStore.SetUint(raftwal.GroupId, uint64(gid))
-
-	gr.Node = newNode(walStore, gid, raftIdx, x.WorkerConfig.MyAddr)
+	g.Unlock()
 
 	x.Checkf(schema.LoadFromDb(context.Background()), "Error while initializing schema")
 	glog.Infof("Load schema from DB: OK")
-	raftServer.UpdateNode(gr.Node.Node)
-	gr.Node.InitAndStartNode()
-	glog.Infof("Init and start Raft node: OK")
 
-	go gr.sendMembershipUpdates()
-	go gr.receiveMembershipUpdates()
-	go gr.processOracleDeltaStream()
-
-	gr.informZeroAboutTablets()
-	glog.Infof("Informed Zero about tablets I have: OK")
 	gr.applyInitialSchema()
 	gr.applyInitialTypes()
 	glog.Infof("Upserted Schema and Types: OK")
@@ -395,159 +331,29 @@ func (g *groupi) ChecksumsMatch(ctx context.Context) error {
 }
 
 func (g *groupi) BelongsTo(key string) (uint32, error) {
-	if tablet, err := g.Tablet(key); err != nil {
-		return 0, err
-	} else if tablet != nil {
-		return tablet.GroupId, nil
-	}
-	return 0, nil
+	return 1, nil
 }
 
 // BelongsToReadOnly acts like BelongsTo except it does not ask zero to serve
 // the tablet for key if no group is currently serving it.
-// The ts passed should be the start ts of the query, so this method can compare that against a
-// tablet move timestamp. If the tablet was moved to this group after the start ts of the query, we
-// should reject that query.
 func (g *groupi) BelongsToReadOnly(key string, ts uint64) (uint32, error) {
-	g.RLock()
-	tablet := g.tablets[key]
-	g.RUnlock()
-	if tablet != nil {
-		if ts > 0 && ts < tablet.MoveTs {
-			return 0, errors.Errorf("StartTs: %d is from before MoveTs: %d for pred: %q",
-				ts, tablet.MoveTs, key)
-		}
-		return tablet.GetGroupId(), nil
-	}
-
-	// We don't know about this tablet. Talk to dgraphzero to find out who is
-	// serving this tablet.
-	pl := g.connToZeroLeader()
-	zc := pb.NewZeroClient(pl.Get())
-
-	tablet = &pb.Tablet{
-		Predicate: key,
-		ReadOnly:  true,
-	}
-	out, err := zc.ShouldServe(g.Ctx(), tablet)
-	if err != nil {
-		glog.Errorf("Error while ShouldServe grpc call %v", err)
-		return 0, err
-	}
-	if out.GetGroupId() == 0 {
-		return 0, nil
-	}
-
-	g.Lock()
-	defer g.Unlock()
-	g.tablets[key] = out
-	if out != nil && ts > 0 && ts < out.MoveTs {
-		return 0, errors.Errorf("StartTs: %d is from before MoveTs: %d for pred: %q",
-			ts, out.MoveTs, key)
-	}
-	return out.GetGroupId(), nil
+	return 1, nil
 }
 
 func (g *groupi) ServesTablet(key string) (bool, error) {
-	if tablet, err := g.Tablet(key); err != nil {
-		return false, err
-	} else if tablet != nil && tablet.GroupId == groups().groupId() {
-		return true, nil
-	}
-	return false, nil
+	return true, nil
 }
 
-func (g *groupi) sendTablet(tablet *pb.Tablet) (*pb.Tablet, error) {
-	pl := g.connToZeroLeader()
-	zc := pb.NewZeroClient(pl.Get())
-
-	out, err := zc.ShouldServe(g.Ctx(), tablet)
-	if err != nil {
-		glog.Errorf("Error while ShouldServe grpc call %v", err)
-		return nil, err
-	}
-
-	// Do not store tablets with group ID 0, as they are just dummy tablets for
-	// predicates that do no exist.
-	if out.GroupId > 0 {
-		g.Lock()
-		g.tablets[out.GetPredicate()] = out
-		g.Unlock()
-	}
-
-	if out.GroupId == groups().groupId() {
-		glog.Infof("Serving tablet for: %v\n", tablet.GetPredicate())
-	}
-	return out, nil
+func (g *groupi) Tablet(key string) (*pb.Tablet, error) {
+	return &pb.Tablet{GroupId: 1, Predicate: key}, nil
 }
 
 func (g *groupi) Inform(preds []string) ([]*pb.Tablet, error) {
-	unknownPreds := make([]*pb.Tablet, 0)
-	tablets := make([]*pb.Tablet, 0)
-	g.RLock()
-	for _, p := range preds {
-		if len(p) == 0 {
-			continue
-		}
-
-		if tab, ok := g.tablets[p]; !ok {
-			unknownPreds = append(unknownPreds, &pb.Tablet{GroupId: g.groupId(), Predicate: p})
-		} else {
-			tablets = append(tablets, tab)
-		}
-	}
-	g.RUnlock()
-
-	if len(unknownPreds) == 0 {
-		return nil, nil
-	}
-
-	pl := g.connToZeroLeader()
-	zc := pb.NewZeroClient(pl.Get())
-	out, err := zc.Inform(g.Ctx(), &pb.TabletRequest{
-		Tablets: unknownPreds,
-		GroupId: g.groupId(),
-	})
-	if err != nil {
-		glog.Errorf("Error while Inform grpc call %v", err)
-		return nil, err
-	}
-
-	// Do not store tablets with group ID 0, as they are just dummy tablets for
-	// predicates that do no exist.
-	g.Lock()
-	for _, t := range out.Tablets {
-		if t.GroupId > 0 {
-			g.tablets[t.GetPredicate()] = t
-			tablets = append(tablets, t)
-		}
-
-		if t.GroupId == groups().groupId() {
-			glog.Infof("Serving tablet for: %v\n", t.GetPredicate())
-		}
-	}
-	g.Unlock()
-	return tablets, nil
-}
-
-// Do not modify the returned Tablet
-func (g *groupi) Tablet(key string) (*pb.Tablet, error) {
-	// TODO: Remove all this later, create a membership state and apply it
-	g.RLock()
-	tablet, ok := g.tablets[key]
-	g.RUnlock()
-	if ok {
-		return tablet, nil
-	}
-
-	// We don't know about this tablet.
-	// Check with dgraphzero if we can serve it.
-	tablet = &pb.Tablet{GroupId: g.groupId(), Predicate: key}
-	return g.sendTablet(tablet)
+	return nil, nil
 }
 
 func (g *groupi) ForceTablet(key string) (*pb.Tablet, error) {
-	return g.sendTablet(&pb.Tablet{GroupId: g.groupId(), Predicate: key, Force: true})
+	return &pb.Tablet{GroupId: 1, Predicate: key}, nil
 }
 
 func (g *groupi) HasMeInState() bool {
@@ -682,65 +488,12 @@ func (g *groupi) triggerMembershipSync() {
 const connBaseDelay = 100 * time.Millisecond
 
 func (g *groupi) connToZeroLeader() *conn.Pool {
-	pl := g.Leader(0)
-	if pl != nil {
-		return pl
-	}
-	glog.V(1).Infof("No healthy Zero leader found. Trying to find a Zero leader...")
-
-	getLeaderConn := func(zc pb.ZeroClient) *conn.Pool {
-		ctx, cancel := context.WithTimeout(g.Ctx(), 10*time.Second)
-		defer cancel()
-
-		connState, err := zc.Connect(ctx, &pb.Member{ClusterInfoOnly: true})
-		if err != nil || connState == nil {
-			glog.V(1).Infof("While retrieving Zero leader info. Error: %v. Retrying...", err)
-			return nil
-		}
-		for _, mz := range connState.State.GetZeros() {
-			if mz.Leader {
-				return conn.GetPools().Connect(mz.GetAddr(), x.WorkerConfig.TLSClientConfig)
-			}
-		}
-		return nil
-	}
-
-	// No leader found. Let's get the latest membership state from Zero.
-	delay := connBaseDelay
-	maxHalfDelay := time.Second
-	for i := 0; ; i++ { // Keep on retrying. See: https://github.com/dgraph-io/dgraph/issues/2289
-		if g.IsClosed() {
-			return nil
-		}
-
-		time.Sleep(delay)
-		if delay <= maxHalfDelay {
-			delay *= 2
-		}
-
-		zAddrList := x.WorkerConfig.ZeroAddr
-		// Pick addresses in round robin manner.
-		addr := zAddrList[i%len(zAddrList)]
-
-		pl := g.AnyServer(0)
-		if pl == nil {
-			pl = conn.GetPools().Connect(addr, x.WorkerConfig.TLSClientConfig)
-		}
-		if pl == nil {
-			glog.V(1).Infof("No healthy Zero server found. Retrying...")
-			continue
-		}
-		zc := pb.NewZeroClient(pl.Get())
-		if pl := getLeaderConn(zc); pl != nil {
-			glog.V(1).Infof("Found connection to leader: %s", pl.Addr)
-			return pl
-		}
-		glog.V(1).Infof("Unable to connect to a healthy Zero leader. Retrying...")
-	}
+	return nil
 }
 
 func (g *groupi) doSendMembership(tablets map[string]*pb.Tablet) error {
 	leader := g.Node.AmLeader()
+
 	member := &pb.Member{
 		Id:         g.Node.Id,
 		GroupId:    g.groupId(),

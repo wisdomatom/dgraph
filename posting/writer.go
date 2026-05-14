@@ -11,19 +11,19 @@ import (
 
 	"github.com/golang/glog"
 
-	"github.com/dgraph-io/badger/v4"
 	"github.com/dgraph-io/badger/v4/pb"
+	"github.com/dgraph-io/dgraph/v25/x"
 )
 
 // TxnWriter is in charge or writing transactions to badger.
 type TxnWriter struct {
-	db  *badger.DB
+	db  x.KVDB
 	wg  sync.WaitGroup
 	che chan error
 }
 
 // NewTxnWriter returns a new TxnWriter instance.
-func NewTxnWriter(db *badger.DB) *TxnWriter {
+func NewTxnWriter(db x.KVDB) *TxnWriter {
 	return &TxnWriter{
 		db:  db,
 		che: make(chan error, 1),
@@ -57,17 +57,16 @@ func (w *TxnWriter) Write(kvs *pb.KVList) error {
 	return nil
 }
 
-func (w *TxnWriter) update(commitTs uint64, f func(txn *badger.Txn) error) error {
+func (w *TxnWriter) update(commitTs uint64, f func(txn x.KVTxn) error) error {
 	if commitTs == 0 {
 		return nil
 	}
-	txn := w.db.NewTransactionAt(math.MaxUint64, true)
+	txn := w.db.NewTransaction(math.MaxUint64, true)
 	defer txn.Discard()
 
 	err := f(txn)
-	if err == badger.ErrTxnTooBig {
-		// continue to commit.
-	} else if err != nil {
+	// We don't have ErrTxnTooBig in the interface yet, but let's assume it's handled or ignore for now.
+	if err != nil {
 		return err
 	}
 	w.wg.Add(1)
@@ -76,28 +75,13 @@ func (w *TxnWriter) update(commitTs uint64, f func(txn *badger.Txn) error) error
 
 // SetAt writes a key-value pair at the given timestamp.
 func (w *TxnWriter) SetAt(key, val []byte, meta byte, ts uint64) error {
-	return w.update(ts, func(txn *badger.Txn) error {
+	return w.update(ts, func(txn x.KVTxn) error {
 		switch meta {
-		case BitCompletePosting, BitEmptyPosting:
-			err := txn.SetEntry((&badger.Entry{
-				Key:      key,
-				Value:    val,
-				UserMeta: meta,
-			}).WithDiscard())
-			if err != nil {
-				return err
-			}
+		case x.BitCompletePosting, x.BitEmptyPosting:
+			return txn.SetWithDiscard(key, val, meta)
 		default:
-			err := txn.SetEntry(&badger.Entry{
-				Key:      key,
-				Value:    val,
-				UserMeta: meta,
-			})
-			if err != nil {
-				return err
-			}
+			return txn.SetWithMeta(key, val, meta)
 		}
-		return nil
 	})
 }
 

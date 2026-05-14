@@ -73,7 +73,7 @@ func TestCacheAfterDeltaUpdateRecieved(t *testing.T) {
 
 	// Write delta to disk and call update
 	txn := Oracle().RegisterStartTs(5)
-	txn.cache.deltas[string(key)] = delta
+	txn.cache.SetDelta(string(key), delta)
 
 	writer := NewTxnWriter(pstore)
 	require.NoError(t, txn.CommitToDisk(writer, 15))
@@ -212,7 +212,7 @@ func TestCacheStaleWhenMaxTsLessThanReadTs(t *testing.T) {
 	require.NoError(t, err)
 
 	txn1 := Oracle().RegisterStartTs(5)
-	txn1.cache.deltas[string(key)] = delta1
+	txn1.cache.SetDelta(string(key), delta1)
 
 	writer1 := NewTxnWriter(pstore)
 	require.NoError(t, txn1.CommitToDisk(writer1, 10))
@@ -245,7 +245,7 @@ func TestCacheStaleWhenMaxTsLessThanReadTs(t *testing.T) {
 	require.NoError(t, err)
 
 	txn2 := Oracle().RegisterStartTs(15)
-	txn2.cache.deltas[string(key)] = delta2
+	txn2.cache.SetDelta(string(key), delta2)
 
 	writer2 := NewTxnWriter(pstore)
 	require.NoError(t, txn2.CommitToDisk(writer2, 20))

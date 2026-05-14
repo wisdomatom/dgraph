@@ -10,13 +10,13 @@ import (
 
 	"github.com/golang/glog"
 
-	"github.com/dgraph-io/badger/v4"
 	"github.com/dgraph-io/dgraph/v25/conn"
 	"github.com/dgraph-io/dgraph/v25/protos/pb"
 	"github.com/dgraph-io/dgraph/v25/schema"
+	"github.com/dgraph-io/dgraph/v25/x"
 )
 
-func InitForLite(ps *badger.DB) {
+func InitForLite(ps x.KVDB) {
 	pstore = ps
 	groups().state = &pb.MembershipState{}
 	groups().Node = &node{Node: &conn.Node{Id: 1}}

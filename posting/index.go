@@ -682,12 +682,11 @@ type rebuilder struct {
 
 func (r *rebuilder) RunWithoutTemp(ctx context.Context) error {
 	ResetCache()
-	stream := pstore.NewStreamAt(r.startTs)
-	stream.LogPrefix = fmt.Sprintf("Rebuilding index for predicate %s (1/2):", r.attr)
-	stream.Prefix = r.prefix
-	stream.NumGo = 16
+	stream := pstore.NewStream(r.startTs)
+	stream.SetLogPrefix(fmt.Sprintf("Rebuilding index for predicate %s (1/2):", r.attr))
+	stream.SetPrefix(r.prefix)
 	txn := NewTxn(r.startTs)
-	stream.KeyToList = func(key []byte, it *badger.Iterator) (*bpb.KVList, error) {
+	stream.SetKeyToList(func(key []byte, it x.KVStreamIterator) (*bpb.KVList, error) {
 		// We should return quickly if the context is no longer valid.
 		select {
 		case <-ctx.Done():
@@ -708,20 +707,13 @@ func (r *rebuilder) RunWithoutTemp(ctx context.Context) error {
 
 		for it.Valid() {
 			item := it.Item()
-			if !bytes.Equal(item.Key(), l.key) {
-				break
-			}
 			l.maxTs = x.Max(l.maxTs, item.Version())
-			if item.IsDeletedOrExpired() {
-				// Don't consider any more versions.
-				break
-			}
 
 			found = true
 			switch item.UserMeta() {
-			case BitEmptyPosting:
+			case x.BitEmptyPosting:
 				l.minTs = item.Version()
-			case BitCompletePosting:
+			case x.BitCompletePosting:
 				if err := unmarshalOrCopy(l.plist, item); err != nil {
 					return nil, err
 				}
@@ -729,7 +721,7 @@ func (r *rebuilder) RunWithoutTemp(ctx context.Context) error {
 
 				// No need to do Next here. The outer loop can take care of skipping
 				// more versions of the same key.
-			case BitDeltaPosting:
+			case x.BitDeltaPosting:
 				err := item.Value(func(val []byte) error {
 					pl := &pb.PostingList{}
 					if err := proto.Unmarshal(val, pl); err != nil {
@@ -752,17 +744,18 @@ func (r *rebuilder) RunWithoutTemp(ctx context.Context) error {
 			if found {
 				break
 			}
+			it.Next()
 		}
 
 		if _, err := r.fn(pk.Uid, l, txn); err != nil {
 			return nil, err
 		}
 		return nil, nil
-	}
-	stream.Send = func(buf *z.Buffer) error {
+	})
+	stream.Send(func(buf *z.Buffer) error {
 		// TODO. Make an in memory txn with disk backing for more data than memory.
 		return nil
-	}
+	})
 
 	start := time.Now()
 	if err := stream.Orchestrate(ctx); err != nil {
@@ -786,7 +779,7 @@ func (r *rebuilder) RunWithoutTemp(ctx context.Context) error {
 	return x.ExponentialRetry(int(x.Config.MaxRetries),
 		20*time.Millisecond, func() error {
 			err := txn.CommitToDisk(writer, r.startTs)
-			if err == badger.ErrBannedKey {
+			if err == x.ErrKeyNotFound {
 				glog.Errorf("Error while writing to banned namespace.")
 				return nil
 			}
@@ -795,19 +788,17 @@ func (r *rebuilder) RunWithoutTemp(ctx context.Context) error {
 }
 
 func printTreeStats(txn *Txn) {
-	txn.cache.Lock()
-
 	numLevels := 20
 	numNodes := make([]int, numLevels)
 	numConnections := make([]int, numLevels)
 
 	var temp [][]uint64
-	for key, pl := range txn.cache.plists {
+	txn.cache.IteratePlists(func(key string, pl *List) {
 		pk, _ := x.Parse([]byte(key))
 		if strings.HasSuffix(pk.Attr, "__vector_") {
 			data := pl.getPosting(txn.cache.startTs)
 			if data == nil || len(data.Postings) == 0 {
-				continue
+				return
 			}
 
 			err := decodeUint64MatrixUnsafe(data.Postings[0].Value, &temp)
@@ -821,9 +812,8 @@ func printTreeStats(txn *Txn) {
 				}
 				numConnections[i] += len(temp[i])
 			}
-
 		}
-	}
+	})
 
 	for i := range numLevels {
 		fmt.Printf("%d, ", numNodes[i])
@@ -911,11 +901,12 @@ func (r *rebuilder) Run(ctx context.Context) error {
 		dbOpts.BlockCacheSize = 100 << 20
 		dbOpts.IndexCacheSize = 100 << 20
 	}
-	tmpDB, err := badger.OpenManaged(dbOpts)
+	tDB, err := badger.OpenManaged(dbOpts)
 	if err != nil {
 		return errors.Wrap(err, "error opening temp badger for reindexing")
 	}
-	defer tmpDB.Close()
+	defer tDB.Close()
+	tmpDB := x.NewBadgerKV(tDB)
 
 	glog.V(1).Infof(
 		"Rebuilding index for predicate %s: Starting process. StartTs=%d. Prefix=\n%s\n",
@@ -926,16 +917,16 @@ func (r *rebuilder) Run(ctx context.Context) error {
 	var counter uint64 = 1
 
 	tmpWriter := tmpDB.NewManagedWriteBatch()
-	stream := pstore.NewStreamAt(r.startTs)
-	stream.LogPrefix = fmt.Sprintf("Rebuilding index for predicate %s (1/2):", r.attr)
-	stream.Prefix = r.prefix
-	stream.MaxSize = (uint64(dbOpts.MemTableSize) * 9) / 10
+	stream := pstore.NewStream(r.startTs)
+	stream.SetLogPrefix(fmt.Sprintf("Rebuilding index for predicate %s (1/2):", r.attr))
+	stream.SetPrefix(r.prefix)
+	// stream.MaxSize = (uint64(dbOpts.MemTableSize) * 9) / 10
 	//TODO We need to create a single transaction irrespective of the type of the predicate
 	if pred.ValueType == pb.Posting_VFLOAT {
 		x.AssertTrue(false)
 	}
 
-	stream.UseKeyToListWithThreadId = true
+	stream.SetUseKeyToListWithThreadId(true)
 
 	const maxThreadIds = 10000
 
@@ -944,28 +935,28 @@ func (r *rebuilder) Run(ctx context.Context) error {
 		txns[i] = NewTxn(r.startTs)
 	}
 
-	stream.FinishThread = func(threadId int) (*bpb.KVList, error) {
+	stream.SetFinishThread(func(threadId int) (*bpb.KVList, error) {
 		// Convert data into deltas.
 		streamTxn := txns[threadId]
 		streamTxn.Update()
 		// txn.cache.Lock() is not required because we are the only one making changes to txn.
 		kvs := make([]*bpb.KV, 0)
 
-		for key, data := range streamTxn.cache.deltas {
+		streamTxn.cache.IterateDeltas(func(key string, data []byte) {
 			version := atomic.AddUint64(&counter, 1)
 			kv := bpb.KV{
 				Key:      []byte(key),
 				Value:    data,
-				UserMeta: []byte{BitDeltaPosting},
+				UserMeta: []byte{x.BitDeltaPosting},
 				Version:  version,
 			}
 			kvs = append(kvs, &kv)
-		}
+		})
 		txns[threadId] = NewTxn(r.startTs)
 		return &bpb.KVList{Kv: kvs}, nil
-	}
+	})
 
-	stream.KeyToListWithThreadId = func(key []byte, itr *badger.Iterator, threadId int) (*bpb.KVList, error) {
+	stream.SetKeyToListWithThreadId(func(key []byte, itr x.KVStreamIterator, threadId int) (*bpb.KVList, error) {
 		// We should return quickly if the context is no longer valid.
 		select {
 		case <-ctx.Done():
@@ -1002,40 +993,51 @@ func (r *rebuilder) Run(ctx context.Context) error {
 			return nil, err
 		}
 
-		if len(streamTxn.cache.plists) < 10000 {
+		if streamTxn.cache.PlistsLen() < 10000 {
 			return &bpb.KVList{Kv: kvs}, nil
 		}
 
 		// Convert data into deltas.
 		streamTxn.Update()
 		// txn.cache.Lock() is not required because we are the only one making changes to txn.
-		for key, data := range streamTxn.cache.deltas {
+		streamTxn.cache.IterateDeltas(func(key string, data []byte) {
 			version := atomic.AddUint64(&counter, 1)
 			kv := bpb.KV{
 				Key:      []byte(key),
 				Value:    data,
-				UserMeta: []byte{BitDeltaPosting},
+				UserMeta: []byte{x.BitDeltaPosting},
 				Version:  version,
 			}
 			kvs = append(kvs, &kv)
-		}
+		})
 
 		txns[threadId] = NewTxn(r.startTs)
 		return &bpb.KVList{Kv: kvs}, nil
-	}
+	})
 
-	stream.Send = func(buf *z.Buffer) error {
+	stream.Send(func(buf *z.Buffer) error {
 		t1 := time.Now()
 		defer func() {
 			glog.V(1).Infof("Rebuilding index for predicate %s: writing index to badger %d bytes took %v",
 				r.attr, len(buf.Bytes()), time.Since(t1))
 		}()
-		if err := tmpWriter.Write(buf); err != nil {
-			return errors.Wrap(err, "error setting entries in temp badger")
-		}
-
-		return nil
-	}
+		return buf.SliceIterate(func(s []byte) error {
+			var kvs bpb.KVList
+			if err := proto.Unmarshal(s, &kvs); err != nil {
+				return err
+			}
+			for _, kv := range kvs.Kv {
+				var meta byte
+				if len(kv.UserMeta) > 0 {
+					meta = kv.UserMeta[0]
+				}
+				if err := tmpWriter.SetAt(kv.Key, kv.Value, meta, kv.Version); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+	})
 
 	start := time.Now()
 	if err := stream.Orchestrate(ctx); err != nil {
@@ -1056,15 +1058,15 @@ func (r *rebuilder) Run(ctx context.Context) error {
 	}()
 
 	writer := pstore.NewManagedWriteBatch()
-	tmpStream := tmpDB.NewStreamAt(counter)
-	tmpStream.LogPrefix = fmt.Sprintf("Rebuilding index for predicate %s (2/2):", r.attr)
-	tmpStream.KeyToList = func(key []byte, itr *badger.Iterator) (*bpb.KVList, error) {
+	tmpStream := tmpDB.NewStream(counter)
+	tmpStream.SetLogPrefix(fmt.Sprintf("Rebuilding index for predicate %s (2/2):", r.attr))
+	tmpStream.SetKeyToList(func(key []byte, itr x.KVStreamIterator) (*bpb.KVList, error) {
 		l, err := ReadPostingList(key, itr)
 		if err != nil {
 			return nil, errors.Wrap(err, "error in reading posting list from pstore")
 		}
 		// No need to write a loop after ReadPostingList to skip unread entries
-		// for a given key because we only wrote BitDeltaPosting to temp badger.
+		// for a given key because we only wrote x.BitDeltaPosting to temp badger.
 		// We can write the data at their original timestamp in pstore badger.
 		// We do the rollup at MaxUint64 so that we don't change the timestamp of resulting list.
 		kvs, err := l.Rollup(nil, math.MaxUint64)
@@ -1074,35 +1076,26 @@ func (r *rebuilder) Run(ctx context.Context) error {
 
 		MemLayerInstance.del(key)
 		return &bpb.KVList{Kv: kvs}, nil
-	}
-	tmpStream.Send = func(buf *z.Buffer) error {
+	})
+	tmpStream.Send(func(buf *z.Buffer) error {
 		return buf.SliceIterate(func(slice []byte) error {
-			kv := &bpb.KV{}
-			if err := proto.Unmarshal(slice, kv); err != nil {
+			var kvlist bpb.KVList
+			if err := proto.Unmarshal(slice, &kvlist); err != nil {
 				return err
 			}
-			// We choose to write the PL at r.startTs, so it won't be read by txns,
-			// which occurred before this schema mutation.
-			e := &badger.Entry{
-				Key:      kv.Key,
-				Value:    kv.Value,
-				UserMeta: BitCompletePosting,
-			}
-
-			if len(kv.Value) == 0 {
-				e = &badger.Entry{
-					Key:      kv.Key,
-					Value:    kv.Value,
-					UserMeta: BitEmptyPosting,
+			for _, kv := range kvlist.Kv {
+				var meta byte
+				if len(kv.UserMeta) > 0 {
+					meta = kv.UserMeta[0]
 				}
-			}
-
-			if err := writer.SetEntryAt(e.WithDiscard(), r.startTs); err != nil {
-				return errors.Wrap(err, "error in writing index to pstore")
+				// Use SetAt with meta
+				if err := writer.SetAt(kv.Key, kv.Value, meta, r.startTs); err != nil {
+					return errors.Wrap(err, "error in writing index to pstore")
+				}
 			}
 			return nil
 		})
-	}
+	})
 
 	if err := tmpStream.Orchestrate(ctx); err != nil {
 		return err

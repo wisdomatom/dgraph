@@ -360,7 +360,7 @@ func (m *mapper) processReqCh(ctx context.Context) error {
 		}
 
 		switch kv.GetUserMeta()[0] {
-		case posting.BitEmptyPosting, posting.BitCompletePosting, posting.BitDeltaPosting:
+		case x.BitEmptyPosting, x.BitCompletePosting, x.BitDeltaPosting:
 			if in.isNamespaceAwareRestore {
 				if _, ok := in.dropNs[0]; ok {
 					return nil
@@ -416,7 +416,7 @@ func (m *mapper) processReqCh(ctx context.Context) error {
 				}
 			}
 
-		case posting.BitSchemaPosting:
+		case x.BitSchemaPosting:
 			appendNamespace := func() error {
 				// If the backup was taken on old version, we need to append the namespace to
 				// the fields of TypeUpdate.

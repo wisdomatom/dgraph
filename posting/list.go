@@ -51,15 +51,6 @@ const (
 	Del uint32 = 0x02
 	// Ovr means overwrite in mutation layer. It contributes 0 in Length.
 	Ovr uint32 = 0x03
-
-	// BitSchemaPosting signals that the value stores a schema or type.
-	BitSchemaPosting byte = 0x01
-	// BitDeltaPosting signals that the value stores the delta of a posting list.
-	BitDeltaPosting byte = 0x04
-	// BitCompletePosting signals that the values stores a complete posting list.
-	BitCompletePosting byte = 0x08
-	// BitEmptyPosting signals that the value stores an empty posting list.
-	BitEmptyPosting byte = 0x10
 )
 
 // List stores the in-memory representation of a posting list.
@@ -1494,9 +1485,9 @@ func (l *List) ToBackupPostingList(
 	kv.Version = out.newMinTs
 	kv.Value = val
 	if isPlistEmpty(ol) {
-		kv.UserMeta = alloc.Copy([]byte{BitEmptyPosting})
+		kv.UserMeta = alloc.Copy([]byte{x.BitEmptyPosting})
 	} else {
-		kv.UserMeta = alloc.Copy([]byte{BitCompletePosting})
+		kv.UserMeta = alloc.Copy([]byte{x.BitCompletePosting})
 	}
 	return kv, nil
 }
@@ -1522,7 +1513,7 @@ func MarshalPostingList(plist *pb.PostingList, alloc *z.Allocator) *bpb.KV {
 	kv := y.NewKV(alloc)
 	if isPlistEmpty(plist) {
 		kv.Value = nil
-		kv.UserMeta = alloc.Copy([]byte{BitEmptyPosting})
+		kv.UserMeta = alloc.Copy([]byte{x.BitEmptyPosting})
 		return kv
 	}
 	ref := plist.Pack.GetAllocRef()
@@ -1537,7 +1528,7 @@ func MarshalPostingList(plist *pb.PostingList, alloc *z.Allocator) *bpb.KV {
 		plist.Pack.AllocRef = ref
 	}
 	kv.Value = out
-	kv.UserMeta = alloc.Copy([]byte{BitCompletePosting})
+	kv.UserMeta = alloc.Copy([]byte{x.BitCompletePosting})
 	return kv
 }
 
@@ -2241,7 +2232,7 @@ func (l *List) readListPart(startUid uint64) (*pb.PostingList, error) {
 			"cannot generate key for list with base key %s and start UID %d",
 			hex.EncodeToString(l.key), startUid)
 	}
-	txn := pstore.NewTransactionAt(l.minTs, false)
+	txn := pstore.NewTransaction(l.minTs, false)
 	defer txn.Discard()
 	item, err := txn.Get(key)
 	if err != nil {

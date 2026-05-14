@@ -21,7 +21,6 @@ import (
 	"go.opencensus.io/tag"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/dgraph-io/badger/v4"
 	bpb "github.com/dgraph-io/badger/v4/pb"
 	"github.com/dgraph-io/dgo/v250/protos/api"
 	"github.com/dgraph-io/dgraph/v25/protos/pb"
@@ -269,13 +268,10 @@ func (txn *Txn) CommitToDisk(writer *TxnWriter, commitTs uint64) error {
 	}
 
 	cache := txn.cache
-	cache.Lock()
-	defer cache.Unlock()
-
 	var keys []string
-	for key := range cache.deltas {
+	cache.IterateDeltas(func(key string, delta []byte) {
 		keys = append(keys, key)
-	}
+	})
 
 	defer func() {
 		// Add these keys to be rolled up after we're done writing. This is the right place for them
@@ -290,24 +286,20 @@ func (txn *Txn) CommitToDisk(writer *TxnWriter, commitTs uint64) error {
 		// writer.update can return early from the loop in case we encounter badger.ErrTxnTooBig. On
 		// that error, writer.update would still commit the transaction and return any error. If
 		// nil, we continue to process the remaining keys.
-		err := writer.update(commitTs, func(btxn *badger.Txn) error {
+		err := writer.update(commitTs, func(btxn x.KVTxn) error {
 			for ; idx < len(keys); idx++ {
 				key := keys[idx]
-				data := cache.deltas[key]
+				data := cache.GetDelta(key)
 				if len(data) == 0 {
 					continue
 				}
-				if ts := cache.maxVersions[key]; ts >= commitTs {
+				if ts := cache.GetMaxVersion(key); ts >= commitTs {
 					// Skip write because we already have a write at a higher ts.
 					// Logging here can cause a lot of output when doing Raft log replay. So, let's
 					// not output anything here.
 					continue
 				}
-				err := btxn.SetEntry(&badger.Entry{
-					Key:      []byte(key),
-					Value:    data,
-					UserMeta: BitDeltaPosting,
-				})
+				err := btxn.SetWithMeta([]byte(key), data, x.BitDeltaPosting)
 				if err != nil {
 					return err
 				}
@@ -422,15 +414,15 @@ type IterateDiskArgs struct {
 }
 
 func (ml *MemoryLayer) IterateDisk(ctx context.Context, f IterateDiskArgs) error {
-	txn := pstore.NewTransactionAt(f.ReadTs, false)
+	txn := pstore.NewTransaction(f.ReadTs, false)
 	defer txn.Discard()
 
-	itOpt := badger.DefaultIteratorOptions
-	itOpt.PrefetchValues = f.Prefetch
-	itOpt.AllVersions = f.AllVersions
-	itOpt.Reverse = f.Reverse
-	itOpt.Prefix = f.Prefix
-	it := txn.NewIterator(itOpt)
+	it := txn.NewIterator(x.KVIterOpts{
+		PrefetchValues: f.Prefetch,
+		AllVersions:    f.AllVersions,
+		IsReverse:      f.Reverse,
+		Prefix:         f.Prefix,
+	})
 	defer it.Close()
 
 	var prevKey []byte
@@ -459,7 +451,7 @@ func (ml *MemoryLayer) IterateDisk(ctx context.Context, f IterateDiskArgs) error
 			continue
 		}
 
-		if item.UserMeta()&BitEmptyPosting > 0 {
+		if item.UserMeta()&x.BitEmptyPosting > 0 {
 			// This is an empty posting list. So, it should not be included.
 			continue
 		}
@@ -615,12 +607,12 @@ func (txn *Txn) UpdateCachedKeys(commitTs uint64) {
 	}
 
 	MemLayerInstance.wait()
-	for key, delta := range txn.cache.deltas {
+	txn.cache.IterateDeltas(func(key string, delta []byte) {
 		MemLayerInstance.updateItemInCache(key, delta, txn.StartTs, commitTs)
-	}
+	})
 }
 
-func unmarshalOrCopy(plist *pb.PostingList, item *badger.Item) error {
+func unmarshalOrCopy(plist *pb.PostingList, item x.KVItem) error {
 	if plist == nil {
 		return errors.Errorf("cannot unmarshal value to a nil posting list of key %s",
 			hex.Dump(item.Key()))
@@ -638,7 +630,7 @@ func unmarshalOrCopy(plist *pb.PostingList, item *badger.Item) error {
 // ReadPostingList constructs the posting list from the disk using the passed iterator.
 // Use forward iterator with allversions enabled in iter options.
 // key would now be owned by the posting list. So, ensure that it isn't reused elsewhere.
-func ReadPostingList(key []byte, it *badger.Iterator) (*List, error) {
+func ReadPostingList(key []byte, it x.KVIterator) (*List, error) {
 	// Previously, ReadPostingList was not checking that a multi-part list could only
 	// be read via the main key. This lead to issues during rollup because multi-part
 	// lists ended up being rolled-up multiple times. This issue was caught by the
@@ -695,15 +687,11 @@ func ReadPostingList(key []byte, it *badger.Iterator) (*List, error) {
 			break
 		}
 		l.maxTs = x.Max(l.maxTs, item.Version())
-		if item.IsDeletedOrExpired() {
-			// Don't consider any more versions.
-			break
-		}
 
 		switch item.UserMeta() {
-		case BitEmptyPosting:
+		case x.BitEmptyPosting:
 			return l, nil
-		case BitCompletePosting:
+		case x.BitCompletePosting:
 			if err := unmarshalOrCopy(l.plist, item); err != nil {
 				return nil, err
 			}
@@ -712,7 +700,7 @@ func ReadPostingList(key []byte, it *badger.Iterator) (*List, error) {
 			// No need to do Next here. The outer loop can take care of skipping
 			// more versions of the same key.
 			return l, nil
-		case BitDeltaPosting:
+		case x.BitDeltaPosting:
 			err := item.Value(func(val []byte) error {
 				pl := &pb.PostingList{}
 				if err := proto.Unmarshal(val, pl); err != nil {
@@ -726,15 +714,12 @@ func ReadPostingList(key []byte, it *badger.Iterator) (*List, error) {
 				return nil, err
 			}
 			deltaCount++
-		case BitSchemaPosting:
+		case x.BitSchemaPosting:
 			return nil, errors.Errorf(
 				"Trying to read schema in ReadPostingList for key: %s", hex.Dump(key))
 		default:
 			return nil, errors.Errorf(
 				"Unexpected meta: %d for key: %s", item.UserMeta(), hex.Dump(key))
-		}
-		if item.DiscardEarlierVersions() {
-			break
 		}
 		it.Next()
 	}
@@ -776,16 +761,16 @@ func (ml *MemoryLayer) readFromCache(key []byte, readTs uint64) *List {
 	return nil
 }
 
-func (ml *MemoryLayer) readFromDisk(key []byte, pstore *badger.DB, readTs uint64, readUids bool) (*List, error) {
-	txn := pstore.NewTransactionAt(readTs, false)
+func (ml *MemoryLayer) readFromDisk(key []byte, ps x.KVDB, readTs uint64, readUids bool) (*List, error) {
+	txn := ps.NewTransaction(readTs, false)
 	defer txn.Discard()
 
 	// When we do rollups, an older version would go to the top of the LSM tree, which can cause
 	// issues during txn.Get. Therefore, always iterate.
-	iterOpts := badger.DefaultIteratorOptions
-	iterOpts.AllVersions = true
-	iterOpts.PrefetchValues = false
-	itr := txn.NewKeyIterator(key, iterOpts)
+	itr := txn.NewIterator(x.KVIterOpts{
+		AllVersions:    true,
+		PrefetchValues: false,
+	})
 	defer itr.Close()
 	itr.Seek(key)
 	l, err := ReadPostingList(key, itr)
@@ -810,7 +795,7 @@ func (ml *MemoryLayer) saveInCache(key []byte, l *List) {
 	ml.cache.set(key, cacheItem)
 }
 
-func (ml *MemoryLayer) ReadData(key []byte, pstore *badger.DB, readTs uint64, readUids bool) (*List, error) {
+func (ml *MemoryLayer) ReadData(key []byte, ps x.KVDB, readTs uint64, readUids bool) (*List, error) {
 	// We first try to read the data from cache, if it is present. If it's not present, then we would read the
 	// latest data from the disk. This would get stored in the cache. If this read has a minTs > readTs then
 	// we would have to read the correct timestamp from the disk.
@@ -819,7 +804,7 @@ func (ml *MemoryLayer) ReadData(key []byte, pstore *badger.DB, readTs uint64, re
 		l.mutationMap.setTs(readTs)
 		return l, nil
 	}
-	l, err := ml.readFromDisk(key, pstore, math.MaxUint64, readUids)
+	l, err := ml.readFromDisk(key, ps, math.MaxUint64, readUids)
 	if err != nil {
 		return nil, err
 	}
@@ -829,7 +814,7 @@ func (ml *MemoryLayer) ReadData(key []byte, pstore *badger.DB, readTs uint64, re
 		return l, nil
 	}
 
-	l, err = ml.readFromDisk(key, pstore, readTs, readUids)
+	l, err = ml.readFromDisk(key, ps, readTs, readUids)
 	if err != nil {
 		return nil, err
 	}
@@ -838,16 +823,16 @@ func (ml *MemoryLayer) ReadData(key []byte, pstore *badger.DB, readTs uint64, re
 	return l, nil
 }
 
-func GetNew(key []byte, pstore *badger.DB, readTs uint64, readUids bool) (*List, error) {
-	return getNew(key, pstore, readTs, readUids)
+func GetNew(key []byte, ps x.KVDB, readTs uint64, readUids bool) (*List, error) {
+	return getNew(key, ps, readTs, readUids)
 }
 
-func getNew(key []byte, pstore *badger.DB, readTs uint64, readUids bool) (*List, error) {
-	if pstore.IsClosed() {
-		return nil, badger.ErrDBClosed
+func getNew(key []byte, ps x.KVDB, readTs uint64, readUids bool) (*List, error) {
+	if ps == nil {
+		return nil, errors.New("KVDB is nil")
 	}
 
-	l, err := MemLayerInstance.ReadData(key, pstore, readTs, readUids)
+	l, err := MemLayerInstance.ReadData(key, ps, readTs, readUids)
 	if err != nil {
 		return l, err
 	}

@@ -16,7 +16,6 @@ import (
 
 	"github.com/golang/glog"
 	"github.com/pkg/errors"
-	ostats "go.opencensus.io/stats"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -283,14 +282,14 @@ func runSchemaMutation(ctx context.Context, updates []*pb.SchemaUpdate, startTs 
 func updateSchema(s *pb.SchemaUpdate, ts uint64) error {
 	schema.State().Set(s.Predicate, s)
 	schema.State().DeleteMutSchema(s.Predicate)
-	txn := pstore.NewTransactionAt(ts, true)
+	txn := pstore.NewTransaction(ts, true)
 	defer txn.Discard()
 	data, err := proto.Marshal(s)
 	x.Check(err)
 	e := &badger.Entry{
 		Key:      x.SchemaKey(s.Predicate),
 		Value:    data,
-		UserMeta: posting.BitSchemaPosting,
+		UserMeta: x.BitSchemaPosting,
 	}
 	if err = txn.SetEntry(e.WithDiscard()); err != nil {
 		return err
@@ -338,14 +337,14 @@ func runTypeMutation(ctx context.Context, update *pb.TypeUpdate, ts uint64) erro
 // only during schema mutations or we see a new predicate.
 func updateType(typeName string, t *pb.TypeUpdate, ts uint64) error {
 	schema.State().SetType(typeName, t)
-	txn := pstore.NewTransactionAt(ts, true)
+	txn := pstore.NewTransaction(ts, true)
 	defer txn.Discard()
 	data, err := proto.Marshal(t)
 	x.Check(err)
 	e := &badger.Entry{
 		Key:      x.TypeKey(typeName),
 		Value:    data,
-		UserMeta: posting.BitSchemaPosting,
+		UserMeta: x.BitSchemaPosting,
 	}
 	if err := txn.SetEntry(e.WithDiscard()); err != nil {
 		return err
@@ -355,14 +354,13 @@ func updateType(typeName string, t *pb.TypeUpdate, ts uint64) error {
 
 func hasEdges(attr string, startTs uint64) bool {
 	pk := x.ParsedKey{Attr: attr}
-	iterOpt := badger.DefaultIteratorOptions
-	iterOpt.PrefetchValues = false
-	iterOpt.Prefix = pk.DataPrefix()
-
-	txn := pstore.NewTransactionAt(startTs, false)
+	txn := pstore.NewTransaction(startTs, false)
 	defer txn.Discard()
 
-	it := txn.NewIterator(iterOpt)
+	it := txn.NewIterator(x.KVIterOpts{
+		PrefetchValues: false,
+		Prefix:         pk.DataPrefix(),
+	})
 	defer it.Close()
 
 	for it.Rewind(); it.Valid(); it.Next() {
@@ -371,7 +369,7 @@ func hasEdges(attr string, startTs uint64) bool {
 		// posting. This does NOT consider those posting lists which can have multiple deltas
 		// summing up to an empty posting list. I'm leaving it as it is for now. But, this could
 		// cause issues because of this inaccuracy.
-		if it.Item().UserMeta()&posting.BitEmptyPosting == 0 {
+		if it.Item().UserMeta()&x.BitEmptyPosting == 0 {
 			return true
 		}
 	}
@@ -609,33 +607,29 @@ func AssignNsIdsOverNetwork(ctx context.Context, num *pb.Num) (*pb.AssignedIds, 
 	return c.AssignIds(ctx, num)
 }
 
+var (
+	uidCounter uint64 = 1000 // Start from a reasonable number
+)
+
 // AssignUidsOverNetwork sends a request to assign UIDs from the current zero leader.
 func AssignUidsOverNetwork(ctx context.Context, num *pb.Num) (*pb.AssignedIds, error) {
-	// Pass on the incoming metadata to the zero. Namespace from the metadata is required by zero.
-	if md, ok := metadata.FromIncomingContext(ctx); ok {
-		ctx = metadata.NewOutgoingContext(ctx, md)
-	}
-	pl := groups().Leader(0)
-	if pl == nil {
-		return nil, conn.ErrNoConnection
-	}
-
-	con := pl.Get()
-	c := pb.NewZeroClient(con)
-	num.Type = pb.Num_UID
-	return c.AssignIds(ctx, num)
+	start := atomic.AddUint64(&uidCounter, num.Val) - num.Val + 1
+	return &pb.AssignedIds{
+		StartId: start,
+		EndId:   start + num.Val - 1,
+	}, nil
 }
 
 // Timestamps sends a request to assign startTs for a new transaction to the current zero leader.
 func Timestamps(ctx context.Context, num *pb.Num) (*pb.AssignedIds, error) {
-	pl := groups().connToZeroLeader()
-	if pl == nil {
-		return nil, conn.ErrNoConnection
-	}
-
-	con := pl.Get()
-	c := pb.NewZeroClient(con)
-	return c.Timestamps(ctx, num)
+	// This might still be called by some components.
+	start := atomic.AddUint64(&tsCounter, num.Val) - num.Val + 1
+	// Update Oracle's MaxAssigned so queries don't wait for Zero.
+	posting.Oracle().SetMaxAssigned(start + num.Val - 1)
+	return &pb.AssignedIds{
+		StartId: start,
+		EndId:   start + num.Val - 1,
+	}, nil
 }
 
 func fillTxnContext(tctx *api.TxnContext, startTs uint64, isErrored bool) {
@@ -883,48 +877,29 @@ func typeSanityCheck(t *pb.TypeUpdate) error {
 	return nil
 }
 
-// CommitOverNetwork makes a proxy call to Zero to commit or abort a transaction.
-func CommitOverNetwork(ctx context.Context, tc *api.TxnContext) (uint64, error) {
-	ctx, span := otel.Tracer("").Start(ctx, "worker.CommitOverNetwork")
-	defer span.End()
-
-	clientDiscard := false
-	if tc.Aborted {
-		// The client called Discard
-		ostats.Record(ctx, x.TxnDiscards.M(1))
-		clientDiscard = true
+func applyMutations(ctx context.Context, m *pb.Mutations) error {
+	if m.StartTs == 0 {
+		return errors.Errorf("StartTs cannot be zero")
 	}
-
-	pl := groups().Leader(0)
-	if pl == nil {
-		return 0, conn.ErrNoConnection
-	}
-
-	// Do de-duplication before sending the request to zero.
-	tc.Keys = x.Unique(tc.Keys)
-	tc.Preds = x.Unique(tc.Preds)
-
-	zc := pb.NewZeroClient(pl.Get())
-	tctx, err := zc.CommitOrAbort(ctx, tc)
-
-	if err != nil {
-		span.AddEvent("Error in CommitOrAbort", trace.WithAttributes(
-			attribute.String("error", err.Error())))
-		return 0, err
-	}
-	span.AddEvent("Commit status", trace.WithAttributes(
-		attribute.Int64("commitTs", int64(tctx.CommitTs)),
-		attribute.Bool("committed", tctx.CommitTs > 0)))
-
-	if tctx.Aborted || tctx.CommitTs == 0 {
-		if !clientDiscard {
-			// The server aborted the txn (not the client)
-			ostats.Record(ctx, x.TxnAborts.M(1))
+	txn := posting.Oracle().RegisterStartTs(m.StartTs)
+	for _, edge := range m.Edges {
+		if err := runMutation(ctx, edge, txn); err != nil {
+			return err
 		}
-		return 0, dgo.ErrAborted
 	}
-	ostats.Record(ctx, x.TxnCommits.M(1))
-	return tctx.CommitTs, nil
+	if len(m.Schema) > 0 {
+		if err := runSchemaMutation(ctx, m.Schema, m.StartTs); err != nil {
+			return err
+		}
+	}
+	if len(m.Types) > 0 {
+		for _, typ := range m.Types {
+			if err := runTypeMutation(ctx, typ, m.StartTs); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (w *grpcWorker) proposeAndWait(ctx context.Context, txnCtx *api.TxnContext,
@@ -937,20 +912,45 @@ func (w *grpcWorker) proposeAndWait(ctx context.Context, txnCtx *api.TxnContext,
 		}
 	}
 
-	// We should wait to ensure that we have seen all the updates until the StartTs of this mutation
-	// transaction. Otherwise, when we read the posting list value for calculating the indices, we
-	// might be wrong because we might be missing out a commit which has updated the value. This
-	// wait here ensures that the proposal would only be registered after seeing txn status of all
-	// pending transactions. Thus, the ordering would be correct.
 	if err := posting.Oracle().WaitForTs(ctx, m.StartTs); err != nil {
 		return err
 	}
 
-	node := groups().Node
-	err := node.proposeAndWait(ctx, &pb.Proposal{Mutations: m})
-	// When we are filling txn context, we don't need to update latest delta if the transaction has failed.
+	err := applyMutations(ctx, m)
 	fillTxnContext(txnCtx, m.StartTs, err != nil)
 	return err
+}
+
+// CommitOverNetwork makes a proxy call to Zero to commit or abort a transaction.
+func CommitOverNetwork(ctx context.Context, tc *api.TxnContext) (uint64, error) {
+	if tc.Aborted {
+		return 0, nil
+	}
+	commitTs := atomic.AddUint64(&tsCounter, 1)
+
+	// Local commit logic: write deltas to disk and update cache
+	txn := posting.Oracle().GetTxn(tc.StartTs)
+	if txn != nil {
+		writer := posting.NewTxnWriter(pstore)
+		if err := txn.CommitToDisk(writer, commitTs); err != nil {
+			return 0, err
+		}
+		if err := writer.Flush(); err != nil {
+			return 0, err
+		}
+		txn.UpdateCachedKeys(commitTs)
+	}
+
+	posting.Oracle().SetMaxAssigned(commitTs)
+	// Clear pending transaction in Oracle
+	posting.Oracle().ProcessDelta(&pb.OracleDelta{
+		MaxAssigned: commitTs,
+		Txns: []*pb.TxnStatus{
+			{StartTs: tc.StartTs, CommitTs: commitTs},
+		},
+	})
+
+	return commitTs, nil
 }
 
 // Mutate is used to apply mutations over the network on other instances.

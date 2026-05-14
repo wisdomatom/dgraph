@@ -36,6 +36,16 @@ import (
 //	floatCommaList := ([whitespace] "," [whitespace] float32Val)+
 //	float32Val := < a string rep of a float32 value >
 func ParseVFloat(s string) ([]float32, error) {
+	// Fast check to see if it's a float array without allocating.
+	// A float array must start with '[' (ignoring leading whitespace).
+	var start int
+	for start < len(s) && (s[start] == ' ' || s[start] == '\t' || s[start] == '\n' || s[start] == '\r') {
+		start++
+	}
+	if start == len(s) || s[start] != '[' {
+		return nil, errCannotConvertToVFloat
+	}
+
 	// TODO Check if this can be done using lexer
 	s = strings.ReplaceAll(s, "\n", " ")
 	s = strings.ReplaceAll(s, "\t", " ")
@@ -87,6 +97,8 @@ func ParseVFloat(s string) ([]float32, error) {
 	}
 	return result, nil
 }
+
+var errCannotConvertToVFloat = errors.New("cannot convert to vfloat")
 
 func cannotConvertToVFloat(s string) error {
 	return errors.Errorf("cannot convert %s to vfloat", s)

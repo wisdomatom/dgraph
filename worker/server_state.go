@@ -9,11 +9,13 @@ import (
 	"context"
 	"math"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/golang/glog"
 
 	"github.com/dgraph-io/badger/v4"
+	"github.com/dgraph-io/dgraph/v25/posting"
 	"github.com/dgraph-io/dgraph/v25/protos/pb"
 	"github.com/dgraph-io/dgraph/v25/raftwal"
 	"github.com/dgraph-io/dgraph/v25/x"
@@ -49,7 +51,7 @@ const (
 type ServerState struct {
 	FinishCh chan struct{} // channel to wait for all pending reqs to finish.
 
-	Pstore   *badger.DB
+	Pstore   x.KVDB
 	WALstore *raftwal.DiskStorage
 	gcCloser *z.Closer // closer for valueLogGC
 
@@ -123,8 +125,9 @@ func (s *ServerState) InitStorage() {
 		glog.Infof("Opening postings BadgerDB with options: %+v\n", opt)
 		opt.EncryptionKey = key
 
-		s.Pstore, err = badger.OpenManaged(opt)
+		db, err := badger.OpenManaged(opt)
 		x.Checkf(err, "Error while creating badger KV posting store")
+		s.Pstore = x.NewBadgerKV(db)
 
 		// zero out from memory
 		opt.EncryptionKey = nil
@@ -135,7 +138,7 @@ func (s *ServerState) InitStorage() {
 	s.gcCloser = z.NewCloser(3)
 	go x.RunVlogGC(s.Pstore, s.gcCloser)
 	// Commenting this out because Badger is doing its own cache checks.
-	go x.MonitorCacheHealth(s.Pstore, s.gcCloser)
+	// go x.MonitorCacheHealth(s.Pstore, s.gcCloser)
 	go x.MonitorDiskMetrics("postings_fs", Config.PostingDir, s.gcCloser)
 }
 
@@ -150,82 +153,18 @@ func (s *ServerState) Dispose() {
 	}
 }
 
+var (
+	tsCounter uint64 = 100 // Start from a reasonable number
+)
+
 func (s *ServerState) GetTimestamp(readOnly bool) uint64 {
-	tr := tsReq{readOnly: readOnly, ch: make(chan uint64)}
-	s.needTs <- tr
-	return <-tr.ch
+	ts := atomic.AddUint64(&tsCounter, 1)
+	posting.Oracle().SetMaxAssigned(ts)
+	return ts
 }
 
 func (s *ServerState) fillTimestampRequests() {
-	const (
-		initDelay = 10 * time.Millisecond
-		maxDelay  = time.Second
-	)
-
-	defer func() {
-		glog.Infoln("Exiting fillTimestampRequests")
-	}()
-
-	var reqs []tsReq
-	for {
-		// Reset variables.
-		reqs = reqs[:0]
-		delay := initDelay
-
-		select {
-		case <-s.gcCloser.HasBeenClosed():
-			return
-		case req := <-s.needTs:
-		slurpLoop:
-			for {
-				reqs = append(reqs, req)
-				select {
-				case req = <-s.needTs:
-				default:
-					break slurpLoop
-				}
-			}
-		}
-
-		// Generate the request.
-		num := &pb.Num{}
-		for _, r := range reqs {
-			if r.readOnly {
-				num.ReadOnly = true
-			} else {
-				num.Val++
-			}
-		}
-
-		// Execute the request with infinite retries.
-	retry:
-		if s.gcCloser.Ctx().Err() != nil {
-			return
-		}
-		ctx, cancel := context.WithTimeout(s.gcCloser.Ctx(), 10*time.Second)
-		ts, err := Timestamps(ctx, num)
-		cancel()
-		if err != nil {
-			glog.Warningf("Error while retrieving timestamps: %v with delay: %v."+
-				" Will retry...\n", err, delay)
-			time.Sleep(delay)
-			delay *= 2
-			if delay > maxDelay {
-				delay = maxDelay
-			}
-			goto retry
-		}
-		var offset uint64
-		for _, req := range reqs {
-			if req.readOnly {
-				req.ch <- ts.ReadOnly
-			} else {
-				req.ch <- ts.StartId + offset
-				offset++
-			}
-		}
-		x.AssertTrue(ts.StartId == 0 || ts.StartId+offset-1 == ts.EndId)
-	}
+	// No-op for local mode
 }
 
 type tsReq struct {

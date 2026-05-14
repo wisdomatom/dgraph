@@ -414,13 +414,13 @@ func ProcessListBackups(ctx context.Context, location string, creds *x.MinioCred
 
 // BackupProcessor handles the different stages of the backup process.
 type BackupProcessor struct {
-	// DB is the Badger pstore managed by this node.
-	DB *badger.DB
+	// DB is the pstore managed by this node.
+	DB x.KVDB
 	// Request stores the backup request containing the parameters for this backup.
 	Request *pb.BackupRequest
 
 	// txn is used for the iterators in the threadLocal
-	txn     *badger.Txn
+	txn     x.KVTxn
 	threads []*threadLocal
 }
 
@@ -429,11 +429,11 @@ type threadLocal struct {
 	// pre-allocated pb.BackupPostingList object.
 	bpl   pb.BackupPostingList
 	alloc *z.Allocator
-	itr   *badger.Iterator
+	itr   x.KVIterator
 	buf   *z.Buffer
 }
 
-func NewBackupProcessor(db *badger.DB, req *pb.BackupRequest) *BackupProcessor {
+func NewBackupProcessor(db x.KVDB, req *pb.BackupRequest) *BackupProcessor {
 	bp := &BackupProcessor{
 		DB:      db,
 		Request: req,
@@ -450,8 +450,9 @@ func NewBackupProcessor(db *badger.DB, req *pb.BackupRequest) *BackupProcessor {
 			buf:     buf,
 		}
 		if bp.txn != nil {
-			iopt := badger.DefaultIteratorOptions
-			iopt.AllVersions = true
+			iopt := x.KVIterOpts{
+				AllVersions: true,
+			}
 			bp.threads[i].itr = bp.txn.NewIterator(iopt)
 		}
 	}
@@ -733,8 +734,8 @@ func (tl *threadLocal) toBackupList(key []byte, itr *badger.Iterator) (
 	}
 
 	switch item.UserMeta() {
-	case posting.BitEmptyPosting, posting.BitCompletePosting, posting.BitDeltaPosting:
-		l, err := posting.ReadPostingList(key, itr)
+	case x.BitEmptyPosting, x.BitCompletePosting, x.BitDeltaPosting:
+		l, err := posting.ReadPostingList(key, x.NewBadgerIterator(itr))
 		if err != nil {
 			return nil, nil, errors.Wrapf(err, "while reading posting list")
 		}

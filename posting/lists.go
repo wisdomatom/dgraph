@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/dgryski/go-farm"
 	ostats "go.opencensus.io/stats"
 	"go.opencensus.io/tag"
 	"google.golang.org/protobuf/proto"
@@ -24,17 +25,18 @@ import (
 )
 
 const (
-	mb = 1 << 20
+	mb        = 1 << 20
+	numShards = 16
 )
 
 var (
-	pstore                *badger.DB
+	pstore                x.KVDB
 	closer                *z.Closer
 	EnableDetailedMetrics bool
 )
 
 // Init initializes the posting lists package, the in memory and dirty list hash.
-func Init(ps *badger.DB, cacheSize int64, removeOnUpdate bool) {
+func Init(ps x.KVDB, cacheSize int64, removeOnUpdate bool) {
 	pstore = ps
 	closer = z.NewCloser(1)
 	go x.MonitorMemoryMetrics(closer)
@@ -57,15 +59,8 @@ func GetNoStore(key []byte, readTs uint64) (rlist *List, err error) {
 	return getNew(key, pstore, readTs, false)
 }
 
-// LocalCache stores a cache of posting lists and deltas.
-// This doesn't sync, so call this only when you don't care about dirty posting lists in
-// memory(for example before populating snapshot) or after calling syncAllMarks
-type LocalCache struct {
+type cacheShard struct {
 	sync.RWMutex
-
-	startTs  uint64
-	commitTs uint64
-
 	// The keys for these maps is a string representation of the Badger key for the posting list.
 	// deltas keep track of the updates made by txn. These must be kept around until written to disk
 	// during commit.
@@ -77,6 +72,24 @@ type LocalCache struct {
 	// plists are posting lists in memory. They can be discarded to reclaim space.
 	plists map[string]*List
 }
+
+// LocalCache stores a cache of posting lists and deltas.
+// This doesn't sync, so call this only when you don't care about dirty posting lists in
+// memory(for example before populating snapshot) or after calling syncAllMarks
+type LocalCache struct {
+	startTs  uint64
+	commitTs uint64
+	shards   [numShards]cacheShard
+}
+
+func (lc *LocalCache) getShard(key string) *cacheShard {
+	return &lc.shards[farm.Fingerprint64([]byte(key))%numShards]
+}
+
+func (lc *LocalCache) Lock()    {}
+func (lc *LocalCache) Unlock()  {}
+func (lc *LocalCache) RLock()   {}
+func (lc *LocalCache) RUnlock() {}
 
 // struct to implement LocalCache interface from vector-indexer
 // acts as wrapper for dgraph *LocalCache
@@ -130,12 +143,15 @@ func NewViLocalCache(delegate *LocalCache) *viLocalCache {
 
 // NewLocalCache returns a new LocalCache instance.
 func NewLocalCache(startTs uint64) *LocalCache {
-	return &LocalCache{
-		startTs:     startTs,
-		deltas:      make(map[string][]byte),
-		plists:      make(map[string]*List),
-		maxVersions: make(map[string]uint64),
+	lc := &LocalCache{
+		startTs: startTs,
 	}
+	for i := 0; i < numShards; i++ {
+		lc.shards[i].deltas = make(map[string][]byte)
+		lc.shards[i].plists = make(map[string]*List)
+		lc.shards[i].maxVersions = make(map[string]uint64)
+	}
+	return lc
 }
 
 // NoCache returns a new LocalCache instance, which won't cache anything. Useful to pass startTs
@@ -145,13 +161,11 @@ func NoCache(startTs uint64) *LocalCache {
 }
 
 func (lc *LocalCache) UpdateCommitTs(commitTs uint64) {
-	lc.Lock()
-	defer lc.Unlock()
 	lc.commitTs = commitTs
 }
 
 func (lc *LocalCache) Find(pred []byte, filter func([]byte) bool) (uint64, error) {
-	txn := pstore.NewTransactionAt(lc.startTs, false)
+	txn := pstore.NewTransaction(lc.startTs, false)
 	defer txn.Discard()
 
 	attr := string(pred)
@@ -162,13 +176,12 @@ func (lc *LocalCache) Find(pred []byte, filter func([]byte) bool) (uint64, error
 	startKey := x.DataKey(attr, 0)
 	prefix := initKey.DataPrefix()
 
-	result := &pb.List{}
 	var prevKey []byte
-	itOpt := badger.DefaultIteratorOptions
-	itOpt.PrefetchValues = false
-	itOpt.AllVersions = true
-	itOpt.Prefix = prefix
-	it := txn.NewIterator(itOpt)
+	it := txn.NewIterator(x.KVIterOpts{
+		PrefetchValues: false,
+		AllVersions:    true,
+		Prefix:         prefix,
+	})
 	defer it.Close()
 
 	for it.Seek(startKey); it.Valid(); {
@@ -198,44 +211,36 @@ func (lc *LocalCache) Find(pred []byte, filter func([]byte) bool) (uint64, error
 			continue
 		}
 
-		switch {
-		case item.UserMeta()&BitEmptyPosting > 0:
-			// This is an empty posting list. So, it should not be included.
-			continue
-		default:
-			// This bit would only be set if there are valid uids in UidPack.
-			key := x.DataKey(attr, pk.Uid)
-			pl, err := lc.Get(key)
-			if err != nil {
-				return 0, err
-			}
-			vals, err := pl.Value(lc.startTs)
-			switch {
-			case err == ErrNoValue:
-				continue
-			case err != nil:
-				return 0, err
-			}
-
-			if filter(vals.Value.([]byte)) {
-				return pk.Uid, nil
-			}
-
-			continue
+		// This bit would only be set if there are valid uids in UidPack.
+		key := x.DataKey(attr, pk.Uid)
+		pl, err := lc.Get(key)
+		if err != nil {
+			return 0, err
 		}
-	}
+		vals, err := pl.Value(lc.startTs)
+		switch {
+		case err == ErrNoValue:
+			it.Next()
+			continue
+		case err != nil:
+			return 0, err
+		}
 
-	if len(result.Uids) > 0 {
-		return result.Uids[0], nil
+		if filter(vals.Value.([]byte)) {
+			return pk.Uid, nil
+		}
+
+		it.Next()
 	}
 
 	return 0, badger.ErrKeyNotFound
 }
 
 func (lc *LocalCache) getNoStore(key string) *List {
-	lc.RLock()
-	defer lc.RUnlock()
-	if l, ok := lc.plists[key]; ok {
+	shard := lc.getShard(key)
+	shard.RLock()
+	defer shard.RUnlock()
+	if l, ok := shard.plists[key]; ok {
 		return l
 	}
 	return nil
@@ -246,24 +251,26 @@ func (lc *LocalCache) getNoStore(key string) *List {
 // will be returned instead. This behavior is meant to prevent the goroutines
 // using the cache from ending up with an orphaned version of a list.
 func (lc *LocalCache) SetIfAbsent(key string, updated *List) *List {
-	lc.Lock()
-	defer lc.Unlock()
-	if pl, ok := lc.plists[key]; ok {
+	shard := lc.getShard(key)
+	shard.Lock()
+	defer shard.Unlock()
+	if pl, ok := shard.plists[key]; ok {
 		return pl
 	}
-	lc.plists[key] = updated
+	shard.plists[key] = updated
 	return updated
 }
 
 func (lc *LocalCache) getInternal(key []byte, readFromDisk, readUids bool) (*List, error) {
 	skey := string(key)
 	getNewPlistNil := func() (*List, error) {
-		lc.RLock()
-		defer lc.RUnlock()
-		if lc.plists == nil {
+		shard := lc.getShard(skey)
+		shard.RLock()
+		defer shard.RUnlock()
+		if shard.plists == nil {
 			return getNew(key, pstore, lc.startTs, readUids)
 		}
-		if l, ok := lc.plists[skey]; ok {
+		if l, ok := shard.plists[skey]; ok {
 			return l, nil
 		}
 		return nil, nil
@@ -290,11 +297,12 @@ func (lc *LocalCache) getInternal(key []byte, readFromDisk, readUids bool) (*Lis
 
 	// If we just brought this posting list into memory and we already have a delta for it, let's
 	// apply it before returning the list.
-	lc.RLock()
-	if delta, ok := lc.deltas[skey]; ok && len(delta) > 0 {
+	shard := lc.getShard(skey)
+	shard.RLock()
+	if delta, ok := shard.deltas[skey]; ok && len(delta) > 0 {
 		pl.setMutation(lc.startTs, delta)
 	}
-	lc.RUnlock()
+	shard.RUnlock()
 	return lc.SetIfAbsent(skey, pl), nil
 }
 
@@ -312,7 +320,7 @@ func (lc *LocalCache) readPostingListAt(key []byte) (*pb.PostingList, error) {
 	}
 
 	pl := &pb.PostingList{}
-	txn := pstore.NewTransactionAt(lc.startTs, false)
+	txn := pstore.NewTransaction(lc.startTs, false)
 	defer txn.Discard()
 
 	item, err := txn.Get(key)
@@ -332,17 +340,19 @@ func (lc *LocalCache) readPostingListAt(key []byte) (*pb.PostingList, error) {
 func (lc *LocalCache) GetSinglePosting(key []byte) (*pb.PostingList, error) {
 	// This would return an error if there is some data in the local cache, but we couldn't read it.
 	getListFromLocalCache := func() (*pb.PostingList, error) {
-		lc.RLock()
+		skey := string(key)
+		shard := lc.getShard(skey)
+		shard.RLock()
 
 		pl := &pb.PostingList{}
-		if delta, ok := lc.deltas[string(key)]; ok && len(delta) > 0 {
+		if delta, ok := shard.deltas[skey]; ok && len(delta) > 0 {
 			err := proto.Unmarshal(delta, pl)
-			lc.RUnlock()
+			shard.RUnlock()
 			return pl, err
 		}
 
-		l := lc.plists[string(key)]
-		lc.RUnlock()
+		l := shard.plists[skey]
+		shard.RUnlock()
 
 		if l != nil {
 			return l.StaticValue(lc.startTs)
@@ -403,38 +413,144 @@ func (lc *LocalCache) GetFromDelta(key []byte) (*List, error) {
 
 // UpdateDeltasAndDiscardLists updates the delta cache before removing the stored posting lists.
 func (lc *LocalCache) UpdateDeltasAndDiscardLists() {
-	lc.Lock()
-	defer lc.Unlock()
-	if len(lc.plists) == 0 {
-		return
-	}
-
-	for key, pl := range lc.plists {
-		data := pl.getMutation(lc.startTs)
-		if len(data) > 0 {
-			lc.deltas[key] = data
+	for i := 0; i < numShards; i++ {
+		shard := &lc.shards[i]
+		shard.Lock()
+		if len(shard.plists) == 0 {
+			shard.Unlock()
+			continue
 		}
-		lc.maxVersions[key] = pl.maxVersion()
-		// We can't run pl.release() here because LocalCache is still being used by other callers
-		// for the same transaction, who might be holding references to posting lists.
-		// TODO: Find another way to reuse postings via postingPool.
+
+		for key, pl := range shard.plists {
+			data := pl.getMutation(lc.startTs)
+			if len(data) > 0 {
+				shard.deltas[key] = data
+			}
+			shard.maxVersions[key] = pl.maxVersion()
+			// We can't run pl.release() here because LocalCache is still being used by other callers
+			// for the same transaction, who might be holding references to posting lists.
+			// TODO: Find another way to reuse postings via postingPool.
+		}
+		shard.plists = make(map[string]*List)
+		shard.Unlock()
 	}
-	lc.plists = make(map[string]*List)
+}
+
+func (lc *LocalCache) IterateDeltas(f func(key string, delta []byte)) {
+	for i := 0; i < numShards; i++ {
+		shard := &lc.shards[i]
+		shard.RLock()
+		for k, v := range shard.deltas {
+			f(k, v)
+		}
+		shard.RUnlock()
+	}
+}
+
+func (lc *LocalCache) IteratePlists(f func(key string, pl *List)) {
+	for i := 0; i < numShards; i++ {
+		shard := &lc.shards[i]
+		shard.RLock()
+		for k, v := range shard.plists {
+			f(k, v)
+		}
+		shard.RUnlock()
+	}
+}
+
+func (lc *LocalCache) IterateMaxVersions(f func(key string, maxVersion uint64)) {
+	for i := 0; i < numShards; i++ {
+		shard := &lc.shards[i]
+		shard.RLock()
+		for k, v := range shard.maxVersions {
+			f(k, v)
+		}
+		shard.RUnlock()
+	}
+}
+
+func (lc *LocalCache) DeltasLen() int {
+	var count int
+	for i := 0; i < numShards; i++ {
+		shard := &lc.shards[i]
+		shard.RLock()
+		count += len(shard.deltas)
+		shard.RUnlock()
+	}
+	return count
+}
+
+func (lc *LocalCache) PlistsLen() int {
+	var count int
+	for i := 0; i < numShards; i++ {
+		shard := &lc.shards[i]
+		shard.RLock()
+		count += len(shard.plists)
+		shard.RUnlock()
+	}
+	return count
+}
+
+func (lc *LocalCache) HasDelta(key string) bool {
+	shard := lc.getShard(key)
+	shard.RLock()
+	defer shard.RUnlock()
+	_, ok := shard.deltas[key]
+	return ok
+}
+
+func (lc *LocalCache) AnyDelta(f func(key string, delta []byte) bool) bool {
+	for i := 0; i < numShards; i++ {
+		shard := &lc.shards[i]
+		shard.RLock()
+		for k, v := range shard.deltas {
+			if f(k, v) {
+				shard.RUnlock()
+				return true
+			}
+		}
+		shard.RUnlock()
+	}
+	return false
+}
+
+func (lc *LocalCache) GetDelta(key string) []byte {
+	shard := lc.getShard(key)
+	shard.RLock()
+	defer shard.RUnlock()
+	return shard.deltas[key]
+}
+
+func (lc *LocalCache) SetDelta(key string, delta []byte) {
+	shard := lc.getShard(key)
+	shard.Lock()
+	defer shard.Unlock()
+	shard.deltas[key] = delta
+}
+
+func (lc *LocalCache) GetMaxVersion(key string) uint64 {
+	shard := lc.getShard(key)
+	shard.RLock()
+	defer shard.RUnlock()
+	return shard.maxVersions[key]
 }
 
 func (lc *LocalCache) fillPreds(ctx *api.TxnContext, gid uint32) {
-	lc.RLock()
-	defer lc.RUnlock()
-	for key := range lc.deltas {
-		pk, err := x.Parse([]byte(key))
-		x.Check(err)
-		if len(pk.Attr) == 0 {
-			continue
+	for i := 0; i < numShards; i++ {
+		shard := &lc.shards[i]
+		shard.RLock()
+		for key := range shard.deltas {
+			pk, err := x.Parse([]byte(key))
+			x.Check(err)
+			if len(pk.Attr) == 0 {
+				continue
+			}
+			// Also send the group id that the predicate was being served by. This is useful when
+			// checking if Zero should allow a commit during a predicate move.
+			predKey := fmt.Sprintf("%d-%s", gid, pk.Attr)
+			ctx.Preds = append(ctx.Preds, predKey)
 		}
-		// Also send the group id that the predicate was being served by. This is useful when
-		// checking if Zero should allow a commit during a predicate move.
-		predKey := fmt.Sprintf("%d-%s", gid, pk.Attr)
-		ctx.Preds = append(ctx.Preds, predKey)
+		shard.RUnlock()
 	}
 	ctx.Preds = x.Unique(ctx.Preds)
 }

@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: © 2017-2025 Istari Digital, Inc.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 package embeding
 
 import (
@@ -61,6 +66,11 @@ type DgraphServer struct {
 	EmbedDataDir string `toml:"embed_data_dir" mapstructure:"embed_data_dir"`
 }
 
+var (
+	raftTuning   = "learner=false; snapshot-after-entries=100000; snapshot-after-duration=60m; pending-proposals=4096; idx=; group=;"
+	badgerTuning = "compression=snappy; numgoroutines=32;"
+)
+
 func NewDgraphEmbed(conf DgraphServer) (*EmbedDgraph, error) {
 	err := os.Mkdir(conf.EmbedDataDir, 0750)
 	if err != nil && !errors.Is(err, os.ErrExist) {
@@ -79,10 +89,9 @@ func NewDgraphEmbed(conf DgraphServer) (*EmbedDgraph, error) {
 		return nil, err
 	}
 
-	x.WorkerConfig.Raft = z.NewSuperFlag(worker.RaftDefaults)
-	// For embedded server, disable hard sync to improve performance.
-	// This is less safe in case of a crash, but acceptable for local/testing.
-	// x.WorkerConfig.HardSync = false
+	x.WorkerConfig.Raft = z.NewSuperFlag(raftTuning)
+	// For embedded server, disable hard sync to fully utilize NVMe speed for benchmarks.
+	x.WorkerConfig.HardSync = false
 
 	ed := &EmbedDgraph{
 		lock:   &sync.Mutex{},
@@ -172,12 +181,16 @@ func (r *EmbedDgraph) dAlpha(conf DgraphServer, lis *bufconn.Listener) {
 	x.WorkerConfig.ZeroAddr = []string{embedBufNetZero}
 
 	// TODO: optimize these and more options
-	x.WorkerConfig.Badger = badger.DefaultOptions("").FromSuperFlag(worker.BadgerDefaults)
+	x.WorkerConfig.Badger = badger.DefaultOptions("").FromSuperFlag(badgerTuning).
+		WithSyncWrites(false). // Huge throughput boost for benchmarks on NVMe
+		WithInMemory(false).   // Ensure data goes to NVMe but without Fsync bottleneck
+		WithLoggingLevel(badger.ERROR)
+
 	if runtime.GOOS == "windows" {
 		x.WorkerConfig.Badger.ValueLogFileSize = 1024 * 1024 * 64
 	}
 	x.Config.MaxRetries = 10
-	x.Config.Limit = z.NewSuperFlag("max-pending-queries=100000")
+	x.Config.Limit = z.NewSuperFlag("max-pending-queries=1000000")
 	x.Config.LimitNormalizeNode = 1
 
 	// initialize each package
@@ -189,7 +202,8 @@ func (r *EmbedDgraph) dAlpha(conf DgraphServer, lis *bufconn.Listener) {
 	worker.Init(worker.State.Pstore)
 
 	schema.Init(worker.State.Pstore)
-	cacheSizeBytes := 16 * 1024 * 1024
+	// Increase cache for 32GB RAM
+	cacheSizeBytes := 1 * 1024 * 1024 * 1024 // 1GB cache
 	posting.Init(worker.State.Pstore, int64(cacheSizeBytes), false)
 
 	x.Config.LimitMutationsNquad = 2000000
@@ -238,9 +252,9 @@ func (r *EmbedDgraph) dZero(conf DgraphServer, lis *bufconn.Listener) {
 
 	m := conn.NewNode(&rc, store, nil)
 	m.Cfg.DisableProposalForwarding = true
-	// Speed up leader election for embedded mode.
-	m.Cfg.HeartbeatTick = 1
-	m.Cfg.ElectionTick = 3 // With tickDur=20ms, election timeout is ~60ms.
+	// Speed up leader election for embedded mode, but not so fast that it jitters under load.
+	m.Cfg.HeartbeatTick = 2
+	m.Cfg.ElectionTick = 10 // With tickDur=20ms, election timeout is ~200ms.
 	rs := conn.NewRaftServer(m)
 
 	closer := z.NewCloser(1)

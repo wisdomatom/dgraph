@@ -293,6 +293,29 @@ func (o *oracle) MaxAssigned() uint64 {
 	return atomic.LoadUint64(&o.maxAssigned)
 }
 
+func (o *oracle) SetMaxAssigned(ts uint64) {
+	for {
+		cur := atomic.LoadUint64(&o.maxAssigned)
+		if ts <= cur {
+			return
+		}
+		if atomic.CompareAndSwapUint64(&o.maxAssigned, cur, ts) {
+			// Notify waiters
+			o.Lock()
+			for startTs, toNotify := range o.waiters {
+				if startTs <= ts {
+					for _, ch := range toNotify {
+						close(ch)
+					}
+					delete(o.waiters, startTs)
+				}
+			}
+			o.Unlock()
+			return
+		}
+	}
+}
+
 func (o *oracle) WaitForTs(ctx context.Context, startTs uint64) error {
 	ch, ok := o.addToWaiters(startTs)
 	if !ok {
@@ -324,9 +347,9 @@ func (o *oracle) ProcessDelta(delta *pb.OracleDelta) {
 	for _, status := range delta.Txns {
 		txn := o.pendingTxns[status.StartTs]
 		if txn != nil && status.CommitTs > 0 {
-			for k := range txn.cache.deltas {
+			txn.cache.IterateDeltas(func(k string, v []byte) {
 				IncrRollup.addKeyToBatch([]byte(k), 0)
-			}
+			})
 		}
 		delete(o.pendingTxns, status.StartTs)
 	}
@@ -382,12 +405,9 @@ func (o *oracle) GetTxn(startTs uint64) *Txn {
 func (txn *Txn) matchesDelta(ok func(key []byte) bool) bool {
 	txn.Lock()
 	defer txn.Unlock()
-	for key := range txn.cache.deltas {
-		if ok([]byte(key)) {
-			return true
-		}
-	}
-	return false
+	return txn.cache.AnyDelta(func(key string, delta []byte) bool {
+		return ok([]byte(key))
+	})
 }
 
 // IterateTxns returns a list of start timestamps for currently pending transactions, which match

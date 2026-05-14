@@ -837,7 +837,7 @@ func exportInternal(ctx context.Context, in *pb.ExportRequest, db *badger.DB,
 				hex.EncodeToString(item.Key()))
 			return nil, err
 		}
-		pl, err := posting.ReadPostingList(key, itr)
+		pl, err := posting.ReadPostingList(key, x.NewBadgerIterator(itr))
 		if err != nil {
 			return nil, errors.Wrapf(err, "cannot read posting list")
 		}

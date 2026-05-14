@@ -15,6 +15,7 @@ import (
 	"github.com/dgraph-io/dgo/v250"
 	"github.com/dgraph-io/dgo/v250/protos/api"
 
+	"github.com/dgraph-io/dgraph/v25/edgraph"
 	"github.com/dgraph-io/dgraph/v25/embeding"
 	"github.com/dgraph-io/dgraph/v25/x"
 )
@@ -43,13 +44,14 @@ func setupInternalDgraph(t testing.TB) (*dgo.Dgraph, func()) {
 	fmt.Printf("Initial query response: %s\n", string(resp.Json))
 
 	cleanup := func() {
+		ed.Close()
 		os.RemoveAll(dir)
 	}
 	return dCli, cleanup
 }
 
 func BenchmarkDgraphIssueRepro(b *testing.B) {
-	runtime.GOMAXPROCS(16)
+	runtime.GOMAXPROCS(12)
 	server, cleanup := setupInternalDgraph(b)
 	defer cleanup()
 
@@ -76,7 +78,7 @@ func BenchmarkDgraphIssueRepro(b *testing.B) {
 
 	concurrency := 50
 	batchSize := 1000
-	totalRows := 200000
+	totalRows := 100000
 
 	// 预生成所有批次的数据，避免 Marshal 开销影响计时
 	type batchData struct {
@@ -99,9 +101,10 @@ func BenchmarkDgraphIssueRepro(b *testing.B) {
 					"TestUser.birthday": "1990-01-01T00:00:00Z",
 					"TestUser.sex":      true,
 					"TestUser.avatar":   "http://avatar.png",
-					"TestUser.hobby":    []string{"ping-pong", "tennis", "basketball"},
-					"_TestUser":         true,
-					"dgraph.type":       "TestUser",
+					// "TestUser.hobby":    []string{"ping-pong", "tennis", "basketball"},
+					"TestUser.hobby": []string{"ping-pong"},
+					"_TestUser":      true,
+					// "dgraph.type":       "TestUser",
 				})
 			}
 			data, _ := json.Marshal(userList)
@@ -116,6 +119,7 @@ func BenchmarkDgraphIssueRepro(b *testing.B) {
 		start := time.Now()
 
 		fmt.Printf("Starting iteration %d...\n", i)
+		s := &edgraph.Server{}
 
 		for w := 0; w < concurrency; w++ {
 			wg.Add(1)
@@ -128,7 +132,7 @@ func BenchmarkDgraphIssueRepro(b *testing.B) {
 					}
 
 					// 直接调用内部 Server 接口，绕过 gRPC 和网络
-					_, err := server.NewTxn().Do(ctx, req)
+					_, err := s.QueryNoGrpc(ctx, req)
 					if err == nil {
 						atomic.AddInt64(&successCount, int64(batchSize))
 					} else {

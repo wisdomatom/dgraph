@@ -30,7 +30,7 @@ import (
 )
 
 var (
-	pstore       *badger.DB
+	pstore       x.KVDB
 	workerServer *grpc.Server
 	raftServer   conn.RaftServer
 
@@ -45,7 +45,7 @@ func workerPort() int {
 }
 
 // Init initializes this package.
-func Init(ps *badger.DB) {
+func Init(ps x.KVDB) {
 	pstore = ps
 	// needs to be initialized after group config
 	limiter = rateLimiter{c: sync.NewCond(&sync.Mutex{}), max: int(x.WorkerConfig.Raft.GetInt64("pending-proposals"))}
@@ -119,19 +119,26 @@ func BlockingStop() {
 	glog.Infof("Stopping group...")
 	groups().closer.SignalAndWait()
 
-	// Update checkpoint so that proposals are not replayed after the server restarts.
-	glog.Infof("Updating RAFT state before shutting down...")
-	if err := groups().Node.updateRaftProgress(); err != nil {
-		glog.Warningf("Error while updating RAFT progress before shutdown: %v", err)
+	if groups().Node != nil && groups().Node.Node != nil && groups().Node.Store != nil {
+		// Update checkpoint so that proposals are not replayed after the server restarts.
+		glog.Infof("Updating RAFT state before shutting down...")
+		if err := groups().Node.updateRaftProgress(); err != nil {
+			glog.Warningf("Error while updating RAFT progress before shutdown: %v", err)
+		}
 	}
 
-	glog.Infof("Stopping node...")
-	groups().Node.closer.SignalAndWait()
+	if groups().Node != nil {
+		glog.Infof("Stopping node...")
+		groups().Node.closer.SignalAndWait()
+		if groups().Node.cdcTracker != nil {
+			groups().Node.cdcTracker.Close()
+		}
+	}
 
 	glog.Infof("Stopping worker server...")
-	workerServer.Stop()
-
-	groups().Node.cdcTracker.Close()
+	if workerServer != nil {
+		workerServer.Stop()
+	}
 }
 
 // UpdateCacheMb updates the value of cache_mb and updates the corresponding cache sizes.

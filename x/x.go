@@ -49,7 +49,6 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/dgraph-io/badger/v4"
 	bo "github.com/dgraph-io/badger/v4/options"
 	badgerpb "github.com/dgraph-io/badger/v4/pb"
 	"github.com/dgraph-io/dgo/v250"
@@ -1200,7 +1199,7 @@ func IsSuperAdmin(groups []string) bool {
 }
 
 // RunVlogGC runs value log gc on store. It runs GC unconditionally after every 1 minute.
-func RunVlogGC(store *badger.DB, closer *z.Closer) {
+func RunVlogGC(store KVDB, closer *z.Closer) {
 	defer closer.Done()
 
 	ticker := time.Tick(1 * time.Minute)

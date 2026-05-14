@@ -324,7 +324,7 @@ func movePredicateHelper(ctx context.Context, in *pb.MovePredicatePayload) error
 		// For now, just send out full posting lists, because we use delete markers to delete older
 		// data in the prefix range. So, by sending only one version per key, and writing it at a
 		// provided timestamp, we can ensure that these writes are above all the delete markers.
-		l, err := posting.ReadPostingList(key, itr)
+		l, err := posting.ReadPostingList(key, x.NewBadgerIterator(itr))
 		if err != nil {
 			return nil, err
 		}
