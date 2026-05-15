@@ -11,7 +11,6 @@ import (
 
 	"github.com/pkg/errors"
 
-	"github.com/dgraph-io/badger/v4"
 	"github.com/dgraph-io/dgraph/v25/schema"
 	"github.com/dgraph-io/dgraph/v25/tok"
 	"github.com/dgraph-io/dgraph/v25/types"
@@ -196,10 +195,11 @@ func getInequalityTokens(ctx context.Context, readTs uint64, attr, f, lang strin
 	seekKey := x.IndexKey(attr, ineqTokensFinal[0])
 
 	isgeOrGt := f == "ge" || f == "gt" || f == "between"
-	itOpt := badger.DefaultIteratorOptions
-	itOpt.PrefetchValues = false
-	itOpt.Reverse = !isgeOrGt
-	itOpt.Prefix = x.IndexKey(attr, string(tokenizer.Identifier()))
+	itOpt := x.KVIterOpts{
+		PrefetchValues: false,
+		IsReverse:      !isgeOrGt,
+		Prefix:         x.IndexKey(attr, string(tokenizer.Identifier())),
+	}
 	itr := txn.NewIterator(itOpt)
 	defer itr.Close()
 

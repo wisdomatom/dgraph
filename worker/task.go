@@ -2561,10 +2561,11 @@ func (qs *queryState) evaluate(cp countParams, out *pb.Result) error {
 	defer txn.Discard()
 
 	pk := x.ParsedKey{Attr: cp.attr}
-	itOpt := badger.DefaultIteratorOptions
-	itOpt.PrefetchValues = false
-	itOpt.Reverse = cp.fn == "le" || cp.fn == "lt"
-	itOpt.Prefix = pk.CountPrefix(cp.reverse)
+	itOpt := x.KVIterOpts{
+		PrefetchValues: false,
+		IsReverse:      cp.fn == "le" || cp.fn == "lt",
+		Prefix:         pk.CountPrefix(cp.reverse),
+	}
 
 	itr := txn.NewIterator(itOpt)
 	defer itr.Close()

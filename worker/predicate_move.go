@@ -283,7 +283,7 @@ func movePredicateHelper(ctx context.Context, in *pb.MovePredicatePayload) error
 	schemaKey := x.SchemaKey(in.Predicate)
 	item, err := txn.Get(schemaKey)
 	switch {
-	case err == badger.ErrKeyNotFound:
+	case err == x.ErrKeyNotFound:
 		// The predicate along with the schema could have been deleted. In that case badger would
 		// return ErrKeyNotFound. We don't want to try and access item.Value() in that case.
 	case err != nil:
@@ -318,30 +318,35 @@ func movePredicateHelper(ctx context.Context, in *pb.MovePredicatePayload) error
 	// sends all data except schema, schema key has different prefix
 	// Read the predicate keys and stream to keysCh.
 	stream := pstore.NewStreamAt(in.TxnTs)
-	stream.LogPrefix = fmt.Sprintf("Sending predicate: [%s]", in.Predicate)
-	stream.Prefix = x.PredicatePrefix(in.Predicate)
-	stream.KeyToList = func(key []byte, itr *badger.Iterator) (*bpb.KVList, error) {
+	stream.SetLogPrefix(fmt.Sprintf("Sending predicate: [%s]", in.Predicate))
+	stream.SetPrefix(x.PredicatePrefix(in.Predicate))
+	stream.SetKeyToList(func(key []byte, itr x.KVStreamIterator) (*bpb.KVList, error) {
 		// For now, just send out full posting lists, because we use delete markers to delete older
 		// data in the prefix range. So, by sending only one version per key, and writing it at a
 		// provided timestamp, we can ensure that these writes are above all the delete markers.
-		l, err := posting.ReadPostingList(key, x.NewBadgerIterator(itr))
+		l, err := posting.ReadPostingList(key, itr)
 		if err != nil {
 			return nil, err
 		}
+
+		// Use a local allocator since itr.Alloc is not in the interface.
+		alloc := z.NewAllocator(1024, "PredicateMove")
+		defer alloc.Release()
+
 		// Setting all the data at in.TxnTs
-		kvs, err := l.Rollup(itr.Alloc, math.MaxUint64)
+		kvs, err := l.Rollup(alloc, math.MaxUint64)
 		for _, kv := range kvs {
 			// Let's set all of them at this move timestamp.
 			kv.Version = in.TxnTs
 		}
 		return &bpb.KVList{Kv: kvs}, err
-	}
-	stream.Send = func(buf *z.Buffer) error {
+	})
+	stream.SetSend(func(buf *z.Buffer) error {
 		kvs := &pb.KVS{
 			Data: buf.Bytes(),
 		}
 		return out.Send(kvs)
-	}
+	})
 	span.AddEvent("Starting stream list orchestrate", trace.WithAttributes(
 		attribute.String("predicate", in.Predicate)))
 	if err := stream.Orchestrate(out.Context()); err != nil {

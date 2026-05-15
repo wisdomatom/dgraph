@@ -25,7 +25,6 @@ import (
 	"github.com/pkg/errors"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/dgraph-io/badger/v4"
 	bpb "github.com/dgraph-io/badger/v4/pb"
 	"github.com/dgraph-io/dgo/v250/protos/api"
 	"github.com/dgraph-io/dgraph/v25/enc"
@@ -772,7 +771,7 @@ func InitWriters(s ExportStorage, in *pb.ExportRequest) (*Writers, error) {
 // when exporting a p directory directly from disk without a running cluster.
 // It uses stream framework to export the data. While it uses an iterator for exporting the schema
 // and types.
-func exportInternal(ctx context.Context, in *pb.ExportRequest, db *badger.DB,
+func exportInternal(ctx context.Context, in *pb.ExportRequest, db x.KVDB,
 	skipZero bool) (ExportedFiles, error) {
 
 	uts := time.Unix(in.UnixTs, 0)
@@ -787,13 +786,14 @@ func exportInternal(ctx context.Context, in *pb.ExportRequest, db *badger.DB,
 	}
 	// This stream exports only the data and the graphQL schema.
 	stream := db.NewStreamAt(in.ReadTs)
-	stream.Prefix = []byte{x.DefaultPrefix}
+	prefix := []byte{x.DefaultPrefix}
 	if in.Namespace != math.MaxUint64 {
 		// Export a specific namespace.
-		stream.Prefix = append(stream.Prefix, x.NamespaceToBytes(in.Namespace)...)
+		prefix = append(prefix, x.NamespaceToBytes(in.Namespace)...)
 	}
-	stream.LogPrefix = "Export"
-	stream.ChooseKey = func(item *badger.Item) bool {
+	stream.SetPrefix(prefix)
+	stream.SetLogPrefix("Export")
+	stream.SetChooseKey(func(item x.KVItem) bool {
 		// Skip exporting delete data including Schema and Types.
 		if item.IsDeletedOrExpired() {
 			return false
@@ -827,9 +827,9 @@ func exportInternal(ctx context.Context, in *pb.ExportRequest, db *badger.DB,
 			return false
 		}
 		return pk.IsData()
-	}
+	})
 
-	stream.KeyToList = func(key []byte, itr *badger.Iterator) (*bpb.KVList, error) {
+	stream.SetKeyToList(func(key []byte, itr x.KVStreamIterator) (*bpb.KVList, error) {
 		item := itr.Item()
 		pk, err := x.Parse(item.Key())
 		if err != nil {
@@ -837,14 +837,14 @@ func exportInternal(ctx context.Context, in *pb.ExportRequest, db *badger.DB,
 				hex.EncodeToString(item.Key()))
 			return nil, err
 		}
-		pl, err := posting.ReadPostingList(key, x.NewBadgerIterator(itr))
+		pl, err := posting.ReadPostingList(key, itr)
 		if err != nil {
 			return nil, errors.Wrapf(err, "cannot read posting list")
 		}
 		return ToExportKvList(pk, pl, in)
-	}
+	})
 
-	stream.Send = func(buf *z.Buffer) error {
+	stream.SetSend(func(buf *z.Buffer) error {
 		kv := &bpb.KV{}
 		return buf.SliceIterate(func(s []byte) error {
 			kv.Reset()
@@ -853,20 +853,23 @@ func exportInternal(ctx context.Context, in *pb.ExportRequest, db *badger.DB,
 			}
 			return WriteExport(writers, kv, in.Format)
 		})
-	}
+	})
 
 	// This is used to export the schema and types.
 	writePrefix := func(prefix byte) error {
 		txn := db.NewTransactionAt(in.ReadTs, false)
 		defer txn.Discard()
 		// We don't need to iterate over all versions.
-		iopts := badger.DefaultIteratorOptions
-		iopts.Prefix = []byte{prefix}
+		prefixBytes := []byte{prefix}
 		if in.Namespace != math.MaxUint64 {
-			iopts.Prefix = append(iopts.Prefix, x.NamespaceToBytes(in.Namespace)...)
+			prefixBytes = append(prefixBytes, x.NamespaceToBytes(in.Namespace)...)
+		}
+		iopts := x.KVIterOpts{
+			Prefix: prefixBytes,
 		}
 
 		itr := txn.NewIterator(iopts)
+
 		defer itr.Close()
 		for itr.Rewind(); itr.Valid(); itr.Next() {
 			item := itr.Item()

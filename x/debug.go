@@ -45,9 +45,9 @@ func VerifyPack(plist *pb.PostingList) {
 
 // VerifySnapshot iterates over all the keys in badger. For all data keys it checks
 // if key is a split key and it verifies if all part are present in badger as well.
-func VerifySnapshot(pstore *badger.DB, readTs uint64) {
+func VerifySnapshot(pstore KVDB, readTs uint64) {
 	stream := pstore.NewStreamAt(readTs)
-	stream.KeyToList = func(key []byte, itr *badger.Iterator) (*bpb.KVList, error) {
+	stream.SetKeyToList(func(key []byte, itr KVStreamIterator) (*bpb.KVList, error) {
 		for ; itr.Valid(); itr.Next() {
 			item := itr.Item()
 			if item.IsDeletedOrExpired() {
@@ -89,16 +89,16 @@ func VerifySnapshot(pstore *badger.DB, readTs uint64) {
 							parsedKey, "\nSplits: ", plist.Splits,
 						)
 					}
+					newTxn.Discard()
 				}
 				return nil
 			})
 			Checkf(err, "Error getting value of key: %v version: %v", k, item.Version())
-
-			if item.DiscardEarlierVersions() {
-				break
-			}
 		}
 		return nil, nil
+	})
+	if err := stream.Orchestrate(context.Background()); err != nil {
+		glog.Errorf("VerifySnapshot failed: %v", err)
 	}
 }
 

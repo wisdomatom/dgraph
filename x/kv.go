@@ -54,9 +54,18 @@ type KVDB interface {
 	BanNamespace(ns uint64) error
 	SetDiscardTs(ts uint64)
 	Tables() []badger.TableInfo
-	NewStreamWriter() *badger.StreamWriter
+	NewStreamWriter() KVStreamWriter
 	Subscribe(ctx context.Context, cb func(*pb.KVList) error, matches []pb.Match) error
 	CacheMaxCost(badger.CacheType, int64) (int64, error)
+}
+
+// KVStreamWriter is the interface for bulk loading data.
+type KVStreamWriter interface {
+	Prepare() error
+	PrepareIncremental() error
+	Write(buf *z.Buffer) error
+	Flush() error
+	Cancel()
 }
 
 // KVTxn is the interface for a KV transaction.
@@ -86,8 +95,11 @@ type KVItem interface {
 	Key() []byte
 	KeyCopy([]byte) []byte
 	Value(func(val []byte) error) error
+	ValueCopy([]byte) ([]byte, error)
 	UserMeta() byte
 	Version() uint64
+	IsDeletedOrExpired() bool
+	ExpiresAt() uint64
 }
 
 // KVIterator is the interface for iterating over KV pairs.
@@ -102,13 +114,15 @@ type KVIterator interface {
 
 // KVStream is the interface for streaming KV pairs.
 type KVStream interface {
-	Send(func(buf *z.Buffer) error)
+	SetSend(func(buf *z.Buffer) error)
 	SetKeyToList(func(key []byte, itr KVStreamIterator) (*pb.KVList, error))
 	SetKeyToListWithThreadId(func(key []byte, itr KVStreamIterator, threadId int) (*pb.KVList, error))
 	SetFinishThread(func(threadId int) (*pb.KVList, error))
 	SetPrefix(prefix []byte)
 	SetLogPrefix(prefix string)
 	SetUseKeyToListWithThreadId(use bool)
+	SetSinceTs(ts uint64)
+	SetChooseKey(func(item KVItem) bool)
 	Orchestrate(ctx context.Context) error
 }
 

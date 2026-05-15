@@ -29,10 +29,19 @@ const (
 	MB = 1 << 20
 )
 
-type badgerWriter interface {
-	Write(buf *z.Buffer) error
-	Flush() error
+type kvWriteBatchShim struct {
+	wb x.KVWriteBatch
 }
+
+func (s *kvWriteBatchShim) Prepare() error            { return nil }
+func (s *kvWriteBatchShim) PrepareIncremental() error { return nil }
+func (s *kvWriteBatchShim) Write(buf *z.Buffer) error {
+	return s.wb.Write(buf)
+}
+func (s *kvWriteBatchShim) Flush() error {
+	return s.wb.Flush()
+}
+func (s *kvWriteBatchShim) Cancel() {}
 
 // populateSnapshot gets data for a shard from the leader and writes it to BadgerDB on the follower.
 func (n *node) populateSnapshot(snap *pb.Snapshot, pl *conn.Pool) error {
@@ -54,7 +63,7 @@ func (n *node) populateSnapshot(snap *pb.Snapshot, pl *conn.Pool) error {
 		return err
 	}
 
-	var writer badgerWriter
+	var writer x.KVStreamWriter
 	if snap.SinceTs == 0 {
 		sw := pstore.NewStreamWriter()
 		defer sw.Cancel()
@@ -65,7 +74,9 @@ func (n *node) populateSnapshot(snap *pb.Snapshot, pl *conn.Pool) error {
 
 		writer = sw
 	} else {
-		writer = pstore.NewManagedWriteBatch()
+		// Use a shim to treat KVWriteBatch as KVStreamWriter
+		wb := pstore.NewManagedWriteBatch()
+		writer = &kvWriteBatchShim{wb}
 	}
 
 	// We can use count to check the number of posting lists returned in tests.
@@ -197,15 +208,15 @@ func doStreamSnapshot(snap *pb.Snapshot, out pb.Worker_StreamSnapshotServer) err
 	}
 
 	stream := pstore.NewStreamAt(snap.ReadTs)
-	stream.LogPrefix = "Sending Snapshot"
+	stream.SetLogPrefix("Sending Snapshot")
 	// Use the default implementation. We no longer try to generate a rolled up posting list here.
 	// Instead, we just stream out all the versions as they are.
-	stream.KeyToList = nil
-	stream.Send = func(buf *z.Buffer) error {
+	stream.SetKeyToList(nil)
+	stream.SetSend(func(buf *z.Buffer) error {
 		kvs := &pb.KVS{Data: buf.Bytes()}
 		return out.Send(kvs)
-	}
-	stream.ChooseKey = func(item *badger.Item) bool {
+	})
+	stream.SetChooseKey(func(item x.KVItem) bool {
 		if item.Version() >= snap.SinceTs {
 			return true
 		}
@@ -217,11 +228,12 @@ func doStreamSnapshot(snap *pb.Snapshot, out pb.Worker_StreamSnapshotServer) err
 		// Type and Schema keys always have a timestamp of 1. They all need to be sent
 		// with the snapshot.
 		pk, err := x.Parse(item.Key())
+
 		if err != nil {
 			return false
 		}
 		return pk.IsSchema() || pk.IsType()
-	}
+	})
 
 	// Get the list of all the predicate and types at the time of the snapshot so that the receiver
 	// can delete predicates

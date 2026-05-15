@@ -682,7 +682,7 @@ type rebuilder struct {
 
 func (r *rebuilder) RunWithoutTemp(ctx context.Context) error {
 	ResetCache()
-	stream := pstore.NewStream(r.startTs)
+	stream := pstore.NewStreamAt(r.startTs)
 	stream.SetLogPrefix(fmt.Sprintf("Rebuilding index for predicate %s (1/2):", r.attr))
 	stream.SetPrefix(r.prefix)
 	txn := NewTxn(r.startTs)
@@ -752,7 +752,7 @@ func (r *rebuilder) RunWithoutTemp(ctx context.Context) error {
 		}
 		return nil, nil
 	})
-	stream.Send(func(buf *z.Buffer) error {
+	stream.SetSend(func(buf *z.Buffer) error {
 		// TODO. Make an in memory txn with disk backing for more data than memory.
 		return nil
 	})
@@ -917,7 +917,7 @@ func (r *rebuilder) Run(ctx context.Context) error {
 	var counter uint64 = 1
 
 	tmpWriter := tmpDB.NewManagedWriteBatch()
-	stream := pstore.NewStream(r.startTs)
+	stream := pstore.NewStreamAt(r.startTs)
 	stream.SetLogPrefix(fmt.Sprintf("Rebuilding index for predicate %s (1/2):", r.attr))
 	stream.SetPrefix(r.prefix)
 	// stream.MaxSize = (uint64(dbOpts.MemTableSize) * 9) / 10
@@ -1015,7 +1015,7 @@ func (r *rebuilder) Run(ctx context.Context) error {
 		return &bpb.KVList{Kv: kvs}, nil
 	})
 
-	stream.Send(func(buf *z.Buffer) error {
+	stream.SetSend(func(buf *z.Buffer) error {
 		t1 := time.Now()
 		defer func() {
 			glog.V(1).Infof("Rebuilding index for predicate %s: writing index to badger %d bytes took %v",
@@ -1058,7 +1058,7 @@ func (r *rebuilder) Run(ctx context.Context) error {
 	}()
 
 	writer := pstore.NewManagedWriteBatch()
-	tmpStream := tmpDB.NewStream(counter)
+	tmpStream := tmpDB.NewStreamAt(counter)
 	tmpStream.SetLogPrefix(fmt.Sprintf("Rebuilding index for predicate %s (2/2):", r.attr))
 	tmpStream.SetKeyToList(func(key []byte, itr x.KVStreamIterator) (*bpb.KVList, error) {
 		l, err := ReadPostingList(key, itr)
@@ -1077,7 +1077,7 @@ func (r *rebuilder) Run(ctx context.Context) error {
 		MemLayerInstance.del(key)
 		return &bpb.KVList{Kv: kvs}, nil
 	})
-	tmpStream.Send(func(buf *z.Buffer) error {
+	tmpStream.SetSend(func(buf *z.Buffer) error {
 		return buf.SliceIterate(func(slice []byte) error {
 			var kvlist bpb.KVList
 			if err := proto.Unmarshal(slice, &kvlist); err != nil {

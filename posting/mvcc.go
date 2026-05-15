@@ -414,7 +414,7 @@ type IterateDiskArgs struct {
 }
 
 func (ml *MemoryLayer) IterateDisk(ctx context.Context, f IterateDiskArgs) error {
-	txn := pstore.NewTransaction(f.ReadTs, false)
+	txn := pstore.NewTransactionAt(f.ReadTs, false)
 	defer txn.Discard()
 
 	it := txn.NewIterator(x.KVIterOpts{
@@ -762,7 +762,7 @@ func (ml *MemoryLayer) readFromCache(key []byte, readTs uint64) *List {
 }
 
 func (ml *MemoryLayer) readFromDisk(key []byte, ps x.KVDB, readTs uint64, readUids bool) (*List, error) {
-	txn := ps.NewTransaction(readTs, false)
+	txn := ps.NewTransactionAt(readTs, false)
 	defer txn.Discard()
 
 	// When we do rollups, an older version would go to the top of the LSM tree, which can cause

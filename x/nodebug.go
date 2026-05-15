@@ -9,7 +9,6 @@
 package x
 
 import (
-	"github.com/dgraph-io/badger/v4"
 	bpb "github.com/dgraph-io/badger/v4/pb"
 	"github.com/dgraph-io/dgraph/v25/protos/pb"
 )
@@ -31,7 +30,7 @@ func VerifyPack(plist *pb.PostingList) {
 }
 
 // VerifySnapshot works in debug mode. Check out the comment in debug_on.go
-func VerifySnapshot(pstore *badger.DB, readTs uint64) {
+func VerifySnapshot(pstore KVDB, readTs uint64) {
 }
 
 // VerifyPostingSplits works in debug mode. Check out the comment in debug_on.go

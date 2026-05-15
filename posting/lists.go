@@ -165,7 +165,7 @@ func (lc *LocalCache) UpdateCommitTs(commitTs uint64) {
 }
 
 func (lc *LocalCache) Find(pred []byte, filter func([]byte) bool) (uint64, error) {
-	txn := pstore.NewTransaction(lc.startTs, false)
+	txn := pstore.NewTransactionAt(lc.startTs, false)
 	defer txn.Discard()
 
 	attr := string(pred)
@@ -320,7 +320,7 @@ func (lc *LocalCache) readPostingListAt(key []byte) (*pb.PostingList, error) {
 	}
 
 	pl := &pb.PostingList{}
-	txn := pstore.NewTransaction(lc.startTs, false)
+	txn := pstore.NewTransactionAt(lc.startTs, false)
 	defer txn.Discard()
 
 	item, err := txn.Get(key)

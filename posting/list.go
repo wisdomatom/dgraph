@@ -2232,7 +2232,7 @@ func (l *List) readListPart(startUid uint64) (*pb.PostingList, error) {
 			"cannot generate key for list with base key %s and start UID %d",
 			hex.EncodeToString(l.key), startUid)
 	}
-	txn := pstore.NewTransaction(l.minTs, false)
+	txn := pstore.NewTransactionAt(l.minTs, false)
 	defer txn.Discard()
 	item, err := txn.Get(key)
 	if err != nil {

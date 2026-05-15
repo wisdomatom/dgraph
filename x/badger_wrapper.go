@@ -86,8 +86,8 @@ func (b *badgerDB) Tables() []badger.TableInfo {
 	return b.db.Tables()
 }
 
-func (b *badgerDB) NewStreamWriter() *badger.StreamWriter {
-	return b.db.NewStreamWriter()
+func (b *badgerDB) NewStreamWriter() KVStreamWriter {
+	return &badgerStreamWriter{sw: b.db.NewStreamWriter()}
 }
 
 func (b *badgerDB) Subscribe(ctx context.Context, cb func(*pb.KVList) error, matches []pb.Match) error {
@@ -96,6 +96,30 @@ func (b *badgerDB) Subscribe(ctx context.Context, cb func(*pb.KVList) error, mat
 
 func (b *badgerDB) CacheMaxCost(t badger.CacheType, cost int64) (int64, error) {
 	return b.db.CacheMaxCost(t, cost)
+}
+
+type badgerStreamWriter struct {
+	sw *badger.StreamWriter
+}
+
+func (s *badgerStreamWriter) Prepare() error {
+	return s.sw.Prepare()
+}
+
+func (s *badgerStreamWriter) PrepareIncremental() error {
+	return s.sw.PrepareIncremental()
+}
+
+func (s *badgerStreamWriter) Write(buf *z.Buffer) error {
+	return s.sw.Write(buf)
+}
+
+func (s *badgerStreamWriter) Flush() error {
+	return s.sw.Flush()
+}
+
+func (s *badgerStreamWriter) Cancel() {
+	s.sw.Cancel()
 }
 
 type badgerTxn struct {
@@ -160,16 +184,29 @@ func (i *badgerItem) KeyCopy(dst []byte) []byte {
 	return i.item.KeyCopy(dst)
 }
 
-func (i *badgerItem) Value(fn func(val []byte) error) error {
-	return i.item.Value(fn)
+func (i *badgerItem) Value(f func(val []byte) error) error {
+	return i.item.Value(f)
+}
+
+func (i *badgerItem) ValueCopy(dst []byte) ([]byte, error) {
+	return i.item.ValueCopy(dst)
 }
 
 func (i *badgerItem) UserMeta() byte {
+
 	return i.item.UserMeta()
 }
 
 func (i *badgerItem) Version() uint64 {
 	return i.item.Version()
+}
+
+func (i *badgerItem) IsDeletedOrExpired() bool {
+	return i.item.IsDeletedOrExpired()
+}
+
+func (i *badgerItem) ExpiresAt() uint64 {
+	return i.item.ExpiresAt()
 }
 
 type badgerIterator struct {
@@ -238,6 +275,20 @@ func (s *badgerStream) SetUseKeyToListWithThreadId(use bool) {
 
 func (s *badgerStream) Orchestrate(ctx context.Context) error {
 	return s.stream.Orchestrate(ctx)
+}
+
+func (s *badgerStream) SetSend(f func(buf *z.Buffer) error) {
+	s.stream.Send = f
+}
+
+func (s *badgerStream) SetSinceTs(ts uint64) {
+	s.stream.SinceTs = ts
+}
+
+func (s *badgerStream) SetChooseKey(f func(item KVItem) bool) {
+	s.stream.ChooseKey = func(item *badger.Item) bool {
+		return f(&badgerItem{item: item})
+	}
 }
 
 type badgerStreamIterator struct {

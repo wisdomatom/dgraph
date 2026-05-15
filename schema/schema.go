@@ -93,7 +93,7 @@ func (s *state) Delete(attr string, ts uint64) error {
 	defer s.Unlock()
 
 	glog.Infof("Deleting schema for predicate: [%s]", attr)
-	txn := pstore.NewTransaction(math.MaxUint64, true)
+	txn := pstore.NewTransactionAt(math.MaxUint64, true)
 	defer txn.Discard()
 	if err := txn.Delete(x.SchemaKey(attr)); err != nil {
 		return err
@@ -118,7 +118,7 @@ func (s *state) DeleteType(typeName string, ts uint64) error {
 	defer s.Unlock()
 
 	glog.Infof("Deleting type definition for type: [%s]", typeName)
-	txn := pstore.NewTransaction(math.MaxUint64, true)
+	txn := pstore.NewTransactionAt(math.MaxUint64, true)
 	defer txn.Discard()
 	if err := txn.Delete(x.TypeKey(typeName)); err != nil {
 		return err
@@ -533,7 +533,7 @@ func Load(predicate string) error {
 	}
 	State().DeleteMutSchema(predicate)
 	key := x.SchemaKey(predicate)
-	txn := pstore.NewTransaction(math.MaxUint64, false)
+	txn := pstore.NewTransactionAt(math.MaxUint64, false)
 	defer txn.Discard()
 	item, err := txn.Get(key)
 	if err != nil {
@@ -572,7 +572,7 @@ const (
 
 // loadFromDb iterates through the DB and loads all the stored schema updates.
 func loadFromDB(ctx context.Context, loadType int) error {
-	stream := pstore.NewStream(math.MaxUint64)
+	stream := pstore.NewStreamAt(math.MaxUint64)
 
 	switch loadType {
 	case loadSchema:

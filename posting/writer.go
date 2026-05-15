@@ -61,7 +61,7 @@ func (w *TxnWriter) update(commitTs uint64, f func(txn x.KVTxn) error) error {
 	if commitTs == 0 {
 		return nil
 	}
-	txn := w.db.NewTransaction(math.MaxUint64, true)
+	txn := w.db.NewTransactionAt(math.MaxUint64, true)
 	defer txn.Discard()
 
 	err := f(txn)

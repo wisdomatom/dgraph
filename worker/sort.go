@@ -18,7 +18,6 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/dgraph-io/badger/v4"
 	"github.com/dgraph-io/dgraph/v25/algo"
 	"github.com/dgraph-io/dgraph/v25/posting"
 	"github.com/dgraph-io/dgraph/v25/protos/pb"
@@ -255,10 +254,12 @@ func sortWithIndex(ctx context.Context, ts *pb.SortMessage) *sortresult {
 	}
 
 	// Iterate over every bucket / token.
-	iterOpt := badger.DefaultIteratorOptions
-	iterOpt.PrefetchValues = false
-	iterOpt.Reverse = order.Desc
-	iterOpt.Prefix = x.IndexKey(order.Attr, string(prefix))
+	iterOpt := x.KVIterOpts{
+		PrefetchValues: false,
+		IsReverse:      order.Desc,
+		Prefix:         x.IndexKey(order.Attr, ""),
+	}
+
 	txn := pstore.NewTransactionAt(ts.ReadTs, false)
 	defer txn.Discard()
 	var seekKey []byte

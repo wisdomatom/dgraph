@@ -19,12 +19,10 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
-	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/dgraph-io/badger/v4"
 	"github.com/dgraph-io/badger/v4/y"
-	"github.com/dgraph-io/dgo/v250"
 	"github.com/dgraph-io/dgo/v250/protos/api"
 	"github.com/dgraph-io/dgraph/v25/conn"
 	"github.com/dgraph-io/dgraph/v25/posting"
@@ -282,7 +280,7 @@ func runSchemaMutation(ctx context.Context, updates []*pb.SchemaUpdate, startTs 
 func updateSchema(s *pb.SchemaUpdate, ts uint64) error {
 	schema.State().Set(s.Predicate, s)
 	schema.State().DeleteMutSchema(s.Predicate)
-	txn := pstore.NewTransaction(ts, true)
+	txn := pstore.NewTransactionAt(ts, true)
 	defer txn.Discard()
 	data, err := proto.Marshal(s)
 	x.Check(err)
@@ -337,7 +335,7 @@ func runTypeMutation(ctx context.Context, update *pb.TypeUpdate, ts uint64) erro
 // only during schema mutations or we see a new predicate.
 func updateType(typeName string, t *pb.TypeUpdate, ts uint64) error {
 	schema.State().SetType(typeName, t)
-	txn := pstore.NewTransaction(ts, true)
+	txn := pstore.NewTransactionAt(ts, true)
 	defer txn.Discard()
 	data, err := proto.Marshal(t)
 	x.Check(err)
@@ -354,7 +352,7 @@ func updateType(typeName string, t *pb.TypeUpdate, ts uint64) error {
 
 func hasEdges(attr string, startTs uint64) bool {
 	pk := x.ParsedKey{Attr: attr}
-	txn := pstore.NewTransaction(startTs, false)
+	txn := pstore.NewTransactionAt(startTs, false)
 	defer txn.Discard()
 
 	it := txn.NewIterator(x.KVIterOpts{

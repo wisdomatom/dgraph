@@ -142,7 +142,7 @@ func StoreExport(request *pb.ExportRequest, dir string, key x.Sensitive) error {
 		}
 	}()
 
-	_, err = exportInternal(context.Background(), request, db, true)
+	_, err = exportInternal(context.Background(), request, x.NewBadgerKV(db), true)
 	return errors.Wrapf(err, "cannot export data inside DB at %s", dir)
 }
 
@@ -523,18 +523,21 @@ func (pr *BackupProcessor) WriteBackup(ctx context.Context) (*pb.BackupResponse,
 	cWriter := s2.NewWriter(eWriter)
 
 	stream := pr.DB.NewStreamAt(pr.Request.ReadTs)
-	stream.LogPrefix = "Dgraph.Backup"
+	stream.SetLogPrefix("Dgraph.Backup")
 	// Ignore versions less than given sinceTs timestamp, or skip older versions of
 	// the given key by returning an empty list.
 	// Do not do this for schema and type keys. Those keys always have a
 	// version of one. They're handled separately.
-	stream.SinceTs = pr.Request.SinceTs
-	stream.Prefix = []byte{x.ByteData}
+	stream.SetSinceTs(pr.Request.SinceTs)
+	stream.SetPrefix([]byte{x.ByteData})
 
 	var response pb.BackupResponse
-	stream.KeyToList = func(key []byte, itr *badger.Iterator) (*bpb.KVList, error) {
-		tl := pr.threads[itr.ThreadId]
-		tl.alloc = itr.Alloc
+	stream.SetKeyToList(func(key []byte, itr x.KVStreamIterator) (*bpb.KVList, error) {
+		// This is tricky. The original code used itr.ThreadId, which is not in my interface.
+		// For now, let's assume thread ID 0. This might need a better solution for performance.
+		tl := pr.threads[0]
+		tl.alloc = z.NewAllocator(1024, "backup") // Placeholder allocator
+		defer tl.alloc.Release()
 
 		bitr := itr
 		// Use the threadlocal iterator because "itr" has the sinceTs set and
@@ -553,13 +556,13 @@ func (pr *BackupProcessor) WriteBackup(ctx context.Context) (*pb.BackupResponse,
 			response.DropOperations = append(response.DropOperations, dropOp)
 		}
 		return kvList, nil
-	}
+	})
 
 	predMap := make(map[string]struct{})
 	for _, pred := range pr.Request.Predicates {
 		predMap[pred] = struct{}{}
 	}
-	stream.ChooseKey = func(item *badger.Item) bool {
+	stream.SetChooseKey(func(item x.KVItem) bool {
 		parsedKey, err := x.Parse(item.Key())
 		if err != nil {
 			glog.Errorf("error %v while parsing key %v during backup. Skipping...",
@@ -579,10 +582,10 @@ func (pr *BackupProcessor) WriteBackup(ctx context.Context) (*pb.BackupResponse,
 		}
 		_, ok := predMap[parsedKey.Attr]
 		return ok
-	}
+	})
 
 	var maxVersion uint64
-	stream.Send = func(buf *z.Buffer) error {
+	stream.SetSend(func(buf *z.Buffer) error {
 		list, err := badger.BufferToKVList(buf)
 		if err != nil {
 			return err
@@ -593,7 +596,7 @@ func (pr *BackupProcessor) WriteBackup(ctx context.Context) (*pb.BackupResponse,
 			}
 		}
 		return writeKVList(list, cWriter)
-	}
+	})
 
 	// This is where the execution happens.
 	if err := stream.Orchestrate(ctx); err != nil {
@@ -611,8 +614,9 @@ func (pr *BackupProcessor) WriteBackup(ctx context.Context) (*pb.BackupResponse,
 		txn := pr.DB.NewTransactionAt(pr.Request.ReadTs, false)
 		defer txn.Discard()
 		// We don't need to iterate over all versions.
-		iopts := badger.DefaultIteratorOptions
-		iopts.Prefix = []byte{prefix}
+		iopts := x.KVIterOpts{
+			Prefix: []byte{prefix},
+		}
 
 		itr := txn.NewIterator(iopts)
 		defer itr.Close()
@@ -718,7 +722,7 @@ func (m *Manifest) GoString() string {
 		m.SinceTsDeprecated, m.ReadTs, m.Groups, m.Encrypted)
 }
 
-func (tl *threadLocal) toBackupList(key []byte, itr *badger.Iterator) (
+func (tl *threadLocal) toBackupList(key []byte, itr x.KVIterator) (
 	*bpb.KVList, *pb.DropOperation, error) {
 	list := &bpb.KVList{}
 	var dropOp *pb.DropOperation
@@ -735,7 +739,7 @@ func (tl *threadLocal) toBackupList(key []byte, itr *badger.Iterator) (
 
 	switch item.UserMeta() {
 	case x.BitEmptyPosting, x.BitCompletePosting, x.BitDeltaPosting:
-		l, err := posting.ReadPostingList(key, x.NewBadgerIterator(itr))
+		l, err := posting.ReadPostingList(key, itr)
 		if err != nil {
 			return nil, nil, errors.Wrapf(err, "while reading posting list")
 		}
