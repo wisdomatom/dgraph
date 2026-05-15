@@ -52,11 +52,47 @@
 - 移除不再需要的 Raft 预选、快照计算等后台 Goroutine，进一步降低 Standalone 模式的 CPU 消耗。
 
 ## 4. 当前构建状态
+
 - **Build Status**: `Passed` (所有核心模块已适配 `x.KVDB` 接口，编译通过)。
 - **Test Status**: Benchmark `BenchmarkDgraphIssueRepro` 运行成功。
-- **Performance**: 在 Standalone 模式下，TPS 达到了 **52k**（优化前约为 20k），验证了剥离 Raft/Zero 后的架构优势。
+- **Performance**: 在 Standalone 模式下，TPS 达到了
+  **52k**（优化前约为 20k），验证了剥离 Raft/Zero 后的架构优势。
 
 ---
-**Prepared by**: Gemini CLI
-**Date**: 2026-05-15
 
+**Prepared by**: Gemini CLI **Date**: 2026-05-15
+
+tiup playground v8.5 --mode tikv-slim
+
+package main
+
+import ( "context" "fmt" "sync" "time"
+
+    "github.com/tikv/client-go/v2/txnkv"
+
+)
+
+func Set(client \*txnkv.Client) { wg := &sync.WaitGroup{} for i := 0; i < 100; i++ { wg.Add(1) go
+func(num int) { defer wg.Done() txn, err := client.Begin() if err != nil { panic(err) } key :=
+fmt.Sprintf("num-%v", num) value := fmt.Sprintf("%v", num) err = txn.Set([]byte(key), []byte(value))
+if err != nil { txn.Rollback() panic(err) } err = txn.Commit(context.TODO()) if err != nil {
+fmt.Println(">>>=======", err) } }(i) } wg.Wait() }
+
+func Iterate(client \*txnkv.Client) { txn, err := client.Begin() if err != nil { panic(err) } iter,
+err := txn.Iter(nil, nil) if err != nil { panic(err) } for iter.Valid() { fmt.Printf("===key(%s)
+===value(%s)\n", iter.Key(), iter.Value()) iter.Next() } iter.Close() err =
+txn.Commit(context.TODO()) if err != nil { panic(err) } }
+
+func GetTS(client \*txnkv.Client) { for i := 0; i < 10; i++ {
+// 可以用这个方法来做uid的生成，不过每条数据都要访问pd一次，性能会有问题。// 如果自增id服务是无状态的，可以考虑使用GetTimestamp +
+local sequence的方式来生成uid，这样就不需要每条数据都访问pd了ts, err :=
+client.GetTimestamp(context.TODO()) fmt.Println("--------", ts, err) } }
+
+func main() { client, err := txnkv.NewClient([]string{ "127.0.0.1:2379", }) if err != nil {
+panic(err) } defer client.Close() s := time.Now()
+
+    Iterate(client)
+
+    fmt.Println("time use: ", time.Since(s))
+
+}
