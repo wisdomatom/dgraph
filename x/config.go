@@ -138,6 +138,8 @@ type WorkerOptions struct {
 	HardSync bool
 	// Audit contains the audit flags that enables the audit.
 	Audit bool
+	// TiKVAddrs stores the list of PD addresses for TiKV.
+	TiKVAddrs []string
 }
 
 // WorkerConfig stores the global instance of the worker package's options.
@@ -158,9 +160,10 @@ func (w WorkerOptions) String() string {
 	return fmt.Sprintf("{TmpDir:%s ExportPath:%s MyAddr:%s ZeroAddr:%v Raft:%v "+
 		"WhiteListedIPRanges:%v StrictMutations:%v AclEnabled:%v AclJwtAlg:%v "+
 		"AclPublicKey:**** AbortOlderThan:%v ProposedGroupId:%d StartTime:%v "+
-		"Security:**** EncryptionKey:**** LogDQLRequest:%d SlowQueryThreshold:%v HardSync:%v Audit:%v}",
+		"Security:**** EncryptionKey:**** LogDQLRequest:%d SlowQueryThreshold:%v "+
+		"HardSync:%v Audit:%v TiKVAddrs:%v}",
 		w.TmpDir, w.ExportPath, w.MyAddr, w.ZeroAddr, w.Raft,
 		w.WhiteListedIPRanges, w.StrictMutations, w.AclEnabled, w.AclJwtAlg,
 		w.AbortOlderThan, w.ProposedGroupId, w.StartTime,
-		w.LogDQLRequest, w.SlowQueryLogThreshold, w.HardSync, w.Audit)
+		w.LogDQLRequest, w.SlowQueryLogThreshold, w.HardSync, w.Audit, w.TiKVAddrs)
 }

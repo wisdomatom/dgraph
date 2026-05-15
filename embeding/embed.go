@@ -56,14 +56,15 @@ type EmbedDgraph struct {
 }
 
 type DgraphServer struct {
-	Url          string `toml:"url" mapstructure:"url"`
-	Host         string `toml:"host" mapstructure:"host"`
-	Grpc         string `toml:"grpc" mapstructure:"grpc"`
-	AuthToken    string `toml:"auth_token" mapstructure:"auth_token"`
-	User         string `toml:"user" mapstructure:"user"`
-	Password     string `toml:"password" mapstructure:"password"`
-	Embed        bool   `toml:"embed" mapstructure:"embed"`
-	EmbedDataDir string `toml:"embed_data_dir" mapstructure:"embed_data_dir"`
+	Url          string   `toml:"url" mapstructure:"url"`
+	Host         string   `toml:"host" mapstructure:"host"`
+	Grpc         string   `toml:"grpc" mapstructure:"grpc"`
+	AuthToken    string   `toml:"auth_token" mapstructure:"auth_token"`
+	User         string   `toml:"user" mapstructure:"user"`
+	Password     string   `toml:"password" mapstructure:"password"`
+	Embed        bool     `toml:"embed" mapstructure:"embed"`
+	EmbedDataDir string   `toml:"embed_data_dir" mapstructure:"embed_data_dir"`
+	TiKVAddrs    []string `toml:"tikv_addrs" mapstructure:"tikv_addrs"`
 }
 
 var (
@@ -92,6 +93,7 @@ func NewDgraphEmbed(conf DgraphServer) (*EmbedDgraph, error) {
 	x.WorkerConfig.Raft = z.NewSuperFlag(raftTuning)
 	// For embedded server, disable hard sync to fully utilize NVMe speed for benchmarks.
 	x.WorkerConfig.HardSync = false
+	x.WorkerConfig.TiKVAddrs = conf.TiKVAddrs
 
 	ed := &EmbedDgraph{
 		lock:   &sync.Mutex{},
@@ -120,7 +122,7 @@ func NewDgraphEmbed(conf DgraphServer) (*EmbedDgraph, error) {
 	}
 	mapV.SetMapIndex(reflect.ValueOf(embedBufNetAlpha), reflect.ValueOf(npA))
 
-	ed.dZero(conf, listenerZero)
+	// ed.dZero(conf, listenerZero)
 
 	ed.dAlpha(conf, listenerAlpha)
 

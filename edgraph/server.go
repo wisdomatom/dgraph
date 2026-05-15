@@ -346,9 +346,9 @@ func (s *Server) Alter(ctx context.Context, op *api.Operation) (*api.Payload, er
 	glog.Infof("Received ALTER op: %+v", op)
 
 	// check if the operation is valid
-	if err := validateAlterOperation(ctx, op); err != nil {
-		return nil, err
-	}
+	// if err := validateAlterOperation(ctx, op); err != nil {
+	// 	return nil, err
+	// }
 
 	defer glog.Infof("ALTER op: %+v done", op)
 

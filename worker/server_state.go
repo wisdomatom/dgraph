@@ -6,6 +6,7 @@
 package worker
 
 import (
+	"fmt"
 	"math"
 	"os"
 	"sync/atomic"
@@ -108,26 +109,35 @@ func (s *ServerState) InitStorage() {
 		// Postings directory
 		// All the writes to posting store should be synchronous. We use batched writers
 		// for posting lists, so the cost of sync writes is amortized.
-		x.Check(os.MkdirAll(Config.PostingDir, 0700))
-		opt := x.WorkerConfig.Badger.
-			WithDir(Config.PostingDir).WithValueDir(Config.PostingDir).
-			WithNumVersionsToKeep(math.MaxInt32).
-			WithNamespaceOffset(x.NamespaceOffset)
-		opt = setBadgerOptions(opt)
+		x.WorkerConfig.TiKVAddrs = []string{"127.0.0.1:2379"}
+		fmt.Println("+++++++++++++++", x.WorkerConfig.TiKVAddrs)
+		if len(x.WorkerConfig.TiKVAddrs) > 0 {
+			glog.Infof("Opening postings TiKV with PD addresses: %v\n", x.WorkerConfig.TiKVAddrs)
+			var err error
+			s.Pstore, err = x.NewTiKVKV(x.WorkerConfig.TiKVAddrs)
+			x.Checkf(err, "Error while creating TiKV KV posting store")
+		} else {
+			x.Check(os.MkdirAll(Config.PostingDir, 0700))
+			opt := x.WorkerConfig.Badger.
+				WithDir(Config.PostingDir).WithValueDir(Config.PostingDir).
+				WithNumVersionsToKeep(math.MaxInt32).
+				WithNamespaceOffset(x.NamespaceOffset)
+			opt = setBadgerOptions(opt)
 
-		// Print the options w/o exposing key.
-		// TODO: Build a stringify interface in Badger options, which is used to print nicely here.
-		key := opt.EncryptionKey
-		opt.EncryptionKey = nil
-		glog.Infof("Opening postings BadgerDB with options: %+v\n", opt)
-		opt.EncryptionKey = key
+			// Print the options w/o exposing key.
+			// TODO: Build a stringify interface in Badger options, which is used to print nicely here.
+			key := opt.EncryptionKey
+			opt.EncryptionKey = nil
+			glog.Infof("Opening postings BadgerDB with options: %+v\n", opt)
+			opt.EncryptionKey = key
 
-		db, err := badger.OpenManaged(opt)
-		x.Checkf(err, "Error while creating badger KV posting store")
-		s.Pstore = x.NewBadgerKV(db)
+			db, err := badger.OpenManaged(opt)
+			x.Checkf(err, "Error while creating badger KV posting store")
+			s.Pstore = x.NewBadgerKV(db)
 
-		// zero out from memory
-		opt.EncryptionKey = nil
+			// zero out from memory
+			opt.EncryptionKey = nil
+		}
 	}
 	// Temp directory
 	x.Check(os.MkdirAll(x.WorkerConfig.TmpDir, 0700))

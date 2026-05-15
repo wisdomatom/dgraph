@@ -21,6 +21,7 @@ import (
 )
 
 func setupInternalDgraph(t testing.TB) (*dgo.Dgraph, func()) {
+	x.WorkerConfig.TiKVAddrs = []string{"127.0.0.1:2379"}
 
 	dir, err := os.MkdirTemp("", "dgraph-benchmarks")
 	x.Check(err)
@@ -44,15 +45,16 @@ func setupInternalDgraph(t testing.TB) (*dgo.Dgraph, func()) {
 	fmt.Printf("Initial query response: %s\n", string(resp.Json))
 
 	cleanup := func() {
-		ed.Close()
+		// ed.Close()
 		os.RemoveAll(dir)
 	}
 	return dCli, cleanup
 }
 
 func BenchmarkDgraphIssueRepro(b *testing.B) {
+	// go test -v -bench BenchmarkDgraphIssueRepro ./dgraph/cmd/alpha --benchtime=1x
 	runtime.GOMAXPROCS(12)
-	server, cleanup := setupInternalDgraph(b)
+	_, cleanup := setupInternalDgraph(b)
 	defer cleanup()
 
 	// 开启 CPU Profile
@@ -61,6 +63,8 @@ func BenchmarkDgraphIssueRepro(b *testing.B) {
 		pprof.StartCPUProfile(f)
 		defer pprof.StopCPUProfile()
 	}
+
+	s := &edgraph.Server{}
 
 	// 初始化 Schema
 	schemaDsl := `
@@ -73,12 +77,12 @@ func BenchmarkDgraphIssueRepro(b *testing.B) {
 		TestUser.avatar: string .
 	`
 	ctx := context.TODO()
-	err = server.Alter(ctx, &api.Operation{Schema: schemaDsl})
+	_, err = s.Alter(ctx, &api.Operation{Schema: schemaDsl})
 	x.Check(err)
 
-	concurrency := 50
-	batchSize := 1000
-	totalRows := 100000
+	concurrency := 1
+	batchSize := 10
+	totalRows := 10
 
 	// 预生成所有批次的数据，避免 Marshal 开销影响计时
 	type batchData struct {
@@ -113,13 +117,13 @@ func BenchmarkDgraphIssueRepro(b *testing.B) {
 	}
 
 	b.ResetTimer()
+
 	for i := 0; i < b.N; i++ {
 		var wg sync.WaitGroup
 		var successCount int64
 		start := time.Now()
 
 		fmt.Printf("Starting iteration %d...\n", i)
-		s := &edgraph.Server{}
 
 		for w := 0; w < concurrency; w++ {
 			wg.Add(1)
@@ -146,10 +150,48 @@ func BenchmarkDgraphIssueRepro(b *testing.B) {
 		fmt.Printf("Iteration %d: TPS=%.2f (Total: %d rows in %v)\n", i, float64(successCount)/duration.Seconds(), successCount, duration)
 	}
 
+	resp, err := s.QueryNoGrpc(context.TODO(), &api.Request{
+		Query: `{query(func: eq(_TestUser, true), first: 10) {
+			uid
+			TestUser.name
+			TestUser.email
+			TestUser.birthday
+			TestUser.sex
+			TestUser.avatar
+			TestUser.hobby
+		}}`,
+	})
+	if err != nil {
+		b.Fatalf("Failed to query count: %v", err)
+	}
+	fmt.Printf("Final count query response: %s\n", string(resp.Json))
+
 	// 打印内存 Profile
 	mf, err := os.Create("mem.prof")
 	if err == nil {
 		pprof.WriteHeapProfile(mf)
 		mf.Close()
 	}
+}
+
+func BenchmarkQuery(b *testing.B) {
+	// go test -v -bench BenchmarkQuery ./dgraph/cmd/alpha --benchtime=1x
+	_, cleanup := setupInternalDgraph(b)
+	defer cleanup()
+	s := &edgraph.Server{}
+	resp, err := s.QueryNoGrpc(context.TODO(), &api.Request{
+		Query: `{query(func: eq(_TestUser, true), first: 10) {
+			uid
+			TestUser.name
+			TestUser.email
+			TestUser.birthday
+			TestUser.sex
+			TestUser.avatar
+			TestUser.hobby
+		}}`,
+	})
+	if err != nil {
+		b.Fatalf("Failed to query count: %v", err)
+	}
+	fmt.Printf("Final count query response: %s\n", string(resp.Json))
 }
