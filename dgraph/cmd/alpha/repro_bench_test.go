@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/dgraph-io/dgraph/v25/embeding"
+	"github.com/tikv/client-go/v2/txnkv"
 	"os"
 	"runtime"
 	"runtime/pprof"
@@ -16,7 +18,7 @@ import (
 	"github.com/dgraph-io/dgo/v250/protos/api"
 
 	"github.com/dgraph-io/dgraph/v25/edgraph"
-	"github.com/dgraph-io/dgraph/v25/embeding"
+	//"github.com/dgraph-io/dgraph/v25/embeding"
 	"github.com/dgraph-io/dgraph/v25/x"
 )
 
@@ -48,7 +50,7 @@ func setupInternalDgraph(t testing.TB) (*dgo.Dgraph, func()) {
 		// ed.Close()
 		os.RemoveAll(dir)
 	}
-	return dCli, cleanup
+	return nil, cleanup
 }
 
 func BenchmarkDgraphIssueRepro(b *testing.B) {
@@ -69,7 +71,7 @@ func BenchmarkDgraphIssueRepro(b *testing.B) {
 	// 初始化 Schema
 	schemaDsl := `
 		TestUser.hobby: [string] .
-		_TestUser: bool @index(bool) .
+		_TestUser: bool .
 		TestUser.name: string @index(hash) .
 		TestUser.email: string @index(exact) .
 		TestUser.birthday: datetime .
@@ -80,9 +82,9 @@ func BenchmarkDgraphIssueRepro(b *testing.B) {
 	_, err = s.Alter(ctx, &api.Operation{Schema: schemaDsl})
 	x.Check(err)
 
-	concurrency := 1
-	batchSize := 10
-	totalRows := 10
+	concurrency := 10
+	batchSize := 1000
+	totalRows := 10000
 
 	// 预生成所有批次的数据，避免 Marshal 开销影响计时
 	type batchData struct {
@@ -100,7 +102,7 @@ func BenchmarkDgraphIssueRepro(b *testing.B) {
 
 				userList = append(userList, map[string]interface{}{
 					"uid":               uid,
-					"TestUser.name":     "tom_batch",
+					"TestUser.name":     fmt.Sprintf("tom_%d_%d_%d", w, bt, j),
 					"TestUser.email":    email,
 					"TestUser.birthday": "1990-01-01T00:00:00Z",
 					"TestUser.sex":      true,
@@ -135,8 +137,7 @@ func BenchmarkDgraphIssueRepro(b *testing.B) {
 						Mutations: []*api.Mutation{{SetJson: allBatches[workerID][bt].data}},
 					}
 
-					// 直接调用内部 Server 接口，绕过 gRPC 和网络
-					_, err := s.QueryNoGrpc(ctx, req)
+					_, err = s.QueryNoGrpc(ctx, req)
 					if err == nil {
 						atomic.AddInt64(&successCount, int64(batchSize))
 					} else {
@@ -151,14 +152,8 @@ func BenchmarkDgraphIssueRepro(b *testing.B) {
 	}
 
 	resp, err := s.QueryNoGrpc(context.TODO(), &api.Request{
-		Query: `{query(func: eq(_TestUser, true), first: 10) {
-			uid
-			TestUser.name
-			TestUser.email
-			TestUser.birthday
-			TestUser.sex
-			TestUser.avatar
-			TestUser.hobby
+		Query: `{query(func: has(TestUser.name)) {
+			count(uid)
 		}}`,
 	})
 	if err != nil {
@@ -174,24 +169,65 @@ func BenchmarkDgraphIssueRepro(b *testing.B) {
 	}
 }
 
-func BenchmarkQuery(b *testing.B) {
+func BenchmarkQueryTikv(b *testing.B) {
 	// go test -v -bench BenchmarkQuery ./dgraph/cmd/alpha --benchtime=1x
 	_, cleanup := setupInternalDgraph(b)
 	defer cleanup()
 	s := &edgraph.Server{}
+	q := `
+{query(func: eq(_TestUser, true)) {
+			count(uid)
+		}}
+`
+	//	q := `
+	//{query(func: eq(_TestUser, true), first: 10) {
+	//			count(uid)
+	//			uid
+	//			TestUser.name
+	//			TestUser.email
+	//			TestUser.birthday
+	//			TestUser.sex
+	//			TestUser.avatar
+	//			TestUser.hobby
+	//		}}
+	//`
+
 	resp, err := s.QueryNoGrpc(context.TODO(), &api.Request{
-		Query: `{query(func: eq(_TestUser, true), first: 10) {
-			uid
-			TestUser.name
-			TestUser.email
-			TestUser.birthday
-			TestUser.sex
-			TestUser.avatar
-			TestUser.hobby
-		}}`,
+		Query: q,
 	})
 	if err != nil {
 		b.Fatalf("Failed to query count: %v", err)
 	}
 	fmt.Printf("Final count query response: %s\n", string(resp.Json))
+}
+
+func Iterate(client *txnkv.Client) {
+	txn, err := client.Begin()
+	if err != nil {
+		panic(err)
+	}
+	iter, err := txn.Iter(nil, nil)
+	if err != nil {
+		panic(err)
+	}
+	for iter.Valid() {
+		//fmt.Printf("===key(%s)===value(%s)\n", iter.Key(), iter.Value())
+		txn.Delete(iter.Key())
+		iter.Next()
+	}
+	iter.Close()
+	err =
+		txn.Commit(context.TODO())
+	if err != nil {
+		panic(err)
+	}
+}
+
+func BenchmarkIter(b *testing.B) {
+	client, err := txnkv.NewClient([]string{"127.0.0.1:2379"})
+	if err != nil {
+		panic(err)
+	}
+	defer client.Close()
+	Iterate(client)
 }

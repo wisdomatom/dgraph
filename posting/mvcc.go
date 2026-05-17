@@ -282,35 +282,18 @@ func (txn *Txn) CommitToDisk(writer *TxnWriter, commitTs uint64) error {
 	}()
 
 	var idx int
-	for idx < len(keys) {
-		// writer.update can return early from the loop in case we encounter badger.ErrTxnTooBig. On
-		// that error, writer.update would still commit the transaction and return any error. If
-		// nil, we continue to process the remaining keys.
-		err := writer.update(commitTs, func(btxn x.KVTxn) error {
-			for ; idx < len(keys); idx++ {
-				key := keys[idx]
-				data := cache.GetDelta(key)
-				if len(data) == 0 {
-					continue
-				}
-				if ts := cache.GetMaxVersion(key); ts >= commitTs {
-					// Skip write because we already have a write at a higher ts.
-					// Logging here can cause a lot of output when doing Raft log replay. So, let's
-					// not output anything here.
-					continue
-				}
-				err := btxn.SetWithMeta([]byte(key), data, x.BitDeltaPosting)
-				if err != nil {
-					return err
-				}
-			}
-			return nil
-		})
+	for ; idx < len(keys); idx++ {
+		key := keys[idx]
+		data := cache.GetDelta(key)
+		if len(data) == 0 {
+			continue
+		}
+		err := txn.KVTxn.SetWithMeta([]byte(key), data, x.BitDeltaPosting)
 		if err != nil {
 			return err
 		}
 	}
-	return nil
+	return txn.KVTxn.CommitAt(commitTs, nil)
 }
 
 func ResetCache() {

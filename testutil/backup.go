@@ -159,7 +159,7 @@ func GetPredicateValues(pdir, attr string, readTs uint64) (map[string]string, er
 			continue
 		}
 
-		pl, err := posting.ReadPostingList(item.Key(), itr)
+		pl, err := posting.ReadPostingList(item.Key(), nil)
 		if err != nil {
 			return nil, err
 		}
@@ -212,8 +212,8 @@ func readSchema(pdir string, dType dataType) ([]string, error) {
 		x.Check(err)
 
 		switch {
-		case item.UserMeta() != posting.BitSchemaPosting:
-			continue
+		//case item.UserMeta() != posting.BitSchemaPosting:
+		//	continue
 		case pk.IsSchema() && dType != schemaPredicate:
 			continue
 		case pk.IsType() && dType != schemaType:

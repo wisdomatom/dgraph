@@ -605,13 +605,15 @@ func AssignNsIdsOverNetwork(ctx context.Context, num *pb.Num) (*pb.AssignedIds, 
 	return c.AssignIds(ctx, num)
 }
 
-var (
-	uidCounter uint64 = 1000 // Start from a reasonable number
-)
-
 // AssignUidsOverNetwork sends a request to assign UIDs from the current zero leader.
 func AssignUidsOverNetwork(ctx context.Context, num *pb.Num) (*pb.AssignedIds, error) {
-	start := atomic.AddUint64(&uidCounter, num.Val) - num.Val + 1
+	start := x.GetNextUid()
+	// We might need to increment it by num.Val if multiple UIDs are needed.
+	// For simplicity, we just use GetNextUid for now, assuming num.Val=1 or
+	// we handle the range correctly.
+	for i := uint64(1); i < num.Val; i++ {
+		x.GetNextUid()
+	}
 	return &pb.AssignedIds{
 		StartId: start,
 		EndId:   start + num.Val - 1,
@@ -621,9 +623,9 @@ func AssignUidsOverNetwork(ctx context.Context, num *pb.Num) (*pb.AssignedIds, e
 // Timestamps sends a request to assign startTs for a new transaction to the current zero leader.
 func Timestamps(ctx context.Context, num *pb.Num) (*pb.AssignedIds, error) {
 	// This might still be called by some components.
-	start := atomic.AddUint64(&tsCounter, num.Val) - num.Val + 1
+	start := State.GetTimestamp(false)
 	// Update Oracle's MaxAssigned so queries don't wait for Zero.
-	posting.Oracle().SetMaxAssigned(start + num.Val - 1)
+	posting.Oracle().SetMaxAssigned(start)
 	return &pb.AssignedIds{
 		StartId: start,
 		EndId:   start + num.Val - 1,
@@ -924,7 +926,7 @@ func CommitOverNetwork(ctx context.Context, tc *api.TxnContext) (uint64, error) 
 	if tc.Aborted {
 		return 0, nil
 	}
-	commitTs := atomic.AddUint64(&tsCounter, 1)
+	commitTs := State.GetTimestamp(false)
 
 	// Local commit logic: write deltas to disk and update cache
 	txn := posting.Oracle().GetTxn(tc.StartTs)

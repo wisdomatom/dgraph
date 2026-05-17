@@ -8,12 +8,14 @@ package x
 import (
 	"bytes"
 	"context"
-	"fmt"
+	"sync"
 
 	"github.com/dgraph-io/badger/v4"
 	"github.com/dgraph-io/badger/v4/pb"
 	"github.com/dgraph-io/ristretto/v2/z"
+	"github.com/pingcap/log"
 	"github.com/pkg/errors"
+	"github.com/tikv/client-go/v2/kv"
 	"github.com/tikv/client-go/v2/txnkv"
 	"github.com/tikv/client-go/v2/txnkv/transaction"
 	"google.golang.org/protobuf/proto"
@@ -24,7 +26,13 @@ type tikvDB struct {
 	pdAddrs []string
 }
 
+var logOnce sync.Once
+
 func NewTiKVKV(pdAddrs []string) (KVDB, error) {
+	logOnce.Do(func() {
+		l, p, _ := log.InitLogger(&log.Config{Level: "warn"})
+		log.ReplaceGlobals(l, p)
+	})
 	client, err := txnkv.NewClient(pdAddrs)
 	if err != nil {
 		return nil, err
@@ -44,6 +52,9 @@ func (t *tikvDB) NewTransactionAt(readTs uint64, update bool) KVTxn {
 		// In our interface, NewTransactionAt doesn't return error.
 		// This is a potential mismatch. For now, panic or handle internally.
 		panic(errors.Wrap(err, "failed to begin tikv transaction"))
+	}
+	if update {
+		txn.SetPessimistic(true)
 	}
 	return &tikvTxn{txn: txn}
 }
@@ -258,6 +269,10 @@ func (t *tikvDB) CacheMaxCost(badger.CacheType, int64) (int64, error) {
 	return 0, nil
 }
 
+func (t *tikvDB) GetTimestamp(ctx context.Context) (uint64, error) {
+	return t.client.GetTimestamp(ctx)
+}
+
 type tikvInternalIterator interface {
 	Valid() bool
 	Key() []byte
@@ -271,7 +286,6 @@ type tikvTxn struct {
 }
 
 func (tx *tikvTxn) Get(key []byte) (KVItem, error) {
-	fmt.Println(">>>>>>>>>>>>>>>>>", string(key))
 	val, err := tx.txn.Get(context.Background(), key)
 	if err != nil {
 		if err.Error() == "not found" { // Need to verify TiKV not found error string or type
@@ -292,11 +306,18 @@ func (tx *tikvTxn) Set(key, val []byte) error {
 
 func (tx *tikvTxn) SetWithMeta(key, val []byte, meta byte) error {
 	// Protocol: [1-byte Meta] + [1-byte Reserved] + [Payload]
-	// fmt.Println(">>>>>>>>>>>>>>>>>", string(key), string(val))
 	buf := make([]byte, 2+len(val))
 	buf[0] = meta
 	buf[1] = 0 // Reserved
 	copy(buf[2:], val)
+
+	if tx.txn.IsPessimistic() {
+		// Lock the key first in pessimistic mode to ensure queuing
+		if err := tx.txn.LockKeys(context.Background(), &kv.LockCtx{}, key); err != nil {
+			return err
+		}
+	}
+
 	return tx.txn.Set(key, buf)
 }
 
@@ -330,15 +351,28 @@ func (tx *tikvTxn) NewIterator(opt KVIterOpts) KVIterator {
 	var iter interface{}
 	var err error
 	if opt.IsReverse {
-		// Handle reverse scan
-		return nil // TODO
+		// Handle reverse scan: TiKV's IterReverse(k) returns keys < k.
+		// To match Badger's Seek(k) returning <= k, we append a null byte to the prefix/key.
+		startKey := make([]byte, len(opt.Prefix), len(opt.Prefix)+1)
+		copy(startKey, opt.Prefix)
+		startKey = append(startKey, 0x00)
+		iter, err = tx.txn.IterReverse(startKey)
 	} else {
 		iter, err = tx.txn.Iter(opt.Prefix, nil)
 	}
 	if err != nil {
 		return nil
 	}
-	return &tikvIterator{iter: iter.(tikvInternalIterator), prefix: opt.Prefix}
+	return &tikvIterator{
+		txn:       tx.txn,
+		iter:      iter.(tikvInternalIterator),
+		prefix:    opt.Prefix,
+		isReverse: opt.IsReverse,
+	}
+}
+
+func (tx *tikvTxn) LockKeys(ctx context.Context, keys ...[]byte) error {
+	return tx.txn.LockKeys(ctx, &kv.LockCtx{}, keys...)
 }
 
 type tikvItem struct {
@@ -376,16 +410,46 @@ func (i *tikvItem) IsDeletedOrExpired() bool { return false }
 func (i *tikvItem) ExpiresAt() uint64        { return 0 }
 
 type tikvIterator struct {
-	iter   tikvInternalIterator
-	prefix []byte
+	txn       *transaction.KVTxn
+	iter      tikvInternalIterator
+	prefix    []byte
+	isReverse bool
 }
 
 func (it *tikvIterator) Rewind() {
-	// TiKV iterator doesn't have Rewind, need to recreate or handle.
+	if it.iter != nil {
+		it.iter.Close()
+	}
+	var err error
+	if it.isReverse {
+		startKey := make([]byte, len(it.prefix), len(it.prefix)+1)
+		copy(startKey, it.prefix)
+		startKey = append(startKey, 0x00)
+		it.iter, err = it.txn.IterReverse(startKey)
+	} else {
+		it.iter, err = it.txn.Iter(it.prefix, nil)
+	}
+	if err != nil {
+		it.iter = nil
+	}
 }
 
 func (it *tikvIterator) Seek(key []byte) {
-	// Handled during creation or by re-iterating.
+	if it.iter != nil {
+		it.iter.Close()
+	}
+	var err error
+	if it.isReverse {
+		startKey := make([]byte, len(key), len(key)+1)
+		copy(startKey, key)
+		startKey = append(startKey, 0x00)
+		it.iter, err = it.txn.IterReverse(startKey)
+	} else {
+		it.iter, err = it.txn.Iter(key, nil)
+	}
+	if err != nil {
+		it.iter = nil
+	}
 }
 
 func (it *tikvIterator) Valid() bool {

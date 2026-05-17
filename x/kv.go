@@ -7,11 +7,25 @@ package x
 
 import (
 	"context"
+	"sync/atomic"
 
 	"github.com/dgraph-io/badger/v4"
 	"github.com/dgraph-io/badger/v4/pb"
 	"github.com/dgraph-io/ristretto/v2/z"
 )
+
+var (
+	tsCounter  uint64 = 100
+	uidCounter uint64 = 100
+)
+
+func GetNextTs() uint64 {
+	return atomic.AddUint64(&tsCounter, 1)
+}
+
+func GetNextUid() uint64 {
+	return atomic.AddUint64(&uidCounter, 1)
+}
 
 var ErrKeyNotFound = badger.ErrKeyNotFound
 
@@ -57,6 +71,7 @@ type KVDB interface {
 	NewStreamWriter() KVStreamWriter
 	Subscribe(ctx context.Context, cb func(*pb.KVList) error, matches []pb.Match) error
 	CacheMaxCost(badger.CacheType, int64) (int64, error)
+	GetTimestamp(ctx context.Context) (uint64, error)
 }
 
 // KVStreamWriter is the interface for bulk loading data.
@@ -88,6 +103,8 @@ type KVTxn interface {
 	Discard()
 	// NewIterator returns a new iterator for the transaction.
 	NewIterator(opt KVIterOpts) KVIterator
+	// LockKeys acquires pessimistic locks on the given keys.
+	LockKeys(ctx context.Context, keys ...[]byte) error
 }
 
 // KVItem is the interface for a single KV pair returned by Get or Iterator.

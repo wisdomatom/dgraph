@@ -6,10 +6,10 @@
 package worker
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"os"
-	"sync/atomic"
 
 	"github.com/golang/glog"
 
@@ -160,12 +160,12 @@ func (s *ServerState) Dispose() {
 	}
 }
 
-var (
-	tsCounter uint64 = 100 // Start from a reasonable number
-)
-
 func (s *ServerState) GetTimestamp(readOnly bool) uint64 {
-	ts := atomic.AddUint64(&tsCounter, 1)
+	ts, err := s.Pstore.GetTimestamp(context.Background())
+	if err != nil {
+		// Fallback to local counter if KV doesn't support global TS
+		ts = x.GetNextTs()
+	}
 	posting.Oracle().SetMaxAssigned(ts)
 	return ts
 }

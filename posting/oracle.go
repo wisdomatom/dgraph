@@ -39,6 +39,7 @@ func init() {
 // Txn represents a transaction.
 type Txn struct {
 	StartTs uint64
+	KVTxn   x.KVTxn
 
 	// atomic
 	shouldAbort uint32
@@ -140,6 +141,7 @@ func (vt *viTxn) UnlockKey(key []byte) {
 func NewTxn(startTs uint64) *Txn {
 	return &Txn{
 		StartTs:    startTs,
+		KVTxn:      pstore.NewTransactionAt(startTs, true),
 		cache:      NewLocalCache(startTs),
 		lastUpdate: time.Now(),
 	}

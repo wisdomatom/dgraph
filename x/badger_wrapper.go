@@ -98,6 +98,10 @@ func (b *badgerDB) CacheMaxCost(t badger.CacheType, cost int64) (int64, error) {
 	return b.db.CacheMaxCost(t, cost)
 }
 
+func (b *badgerDB) GetTimestamp(ctx context.Context) (uint64, error) {
+	return GetNextTs(), nil
+}
+
 type badgerStreamWriter struct {
 	sw *badger.StreamWriter
 }
@@ -170,6 +174,10 @@ func (t *badgerTxn) NewIterator(opt KVIterOpts) KVIterator {
 	bopt.PrefetchValues = opt.PrefetchValues
 	bopt.PrefetchSize = opt.PrefetchSize
 	return &badgerIterator{it: t.txn.NewIterator(bopt)}
+}
+
+func (t *badgerTxn) LockKeys(ctx context.Context, keys ...[]byte) error {
+	return nil
 }
 
 type badgerItem struct {
