@@ -15,7 +15,6 @@ import (
 	"github.com/dgraph-io/ristretto/v2/z"
 	"github.com/pingcap/log"
 	"github.com/pkg/errors"
-	"github.com/tikv/client-go/v2/kv"
 	"github.com/tikv/client-go/v2/txnkv"
 	"github.com/tikv/client-go/v2/txnkv/transaction"
 	"google.golang.org/protobuf/proto"
@@ -27,6 +26,7 @@ type tikvDB struct {
 }
 
 var logOnce sync.Once
+var tikvTxns sync.Map
 
 func NewTiKVKV(pdAddrs []string) (KVDB, error) {
 	logOnce.Do(func() {
@@ -43,18 +43,25 @@ func NewTiKVKV(pdAddrs []string) (KVDB, error) {
 	}, nil
 }
 
-func (t *tikvDB) NewTransactionAt(readTs uint64, update bool) KVTxn {
-	// Note: TiKV Begin() creates a new transaction with a fresh startTS from PD.
-	// Dgraph passes readTs, but TiKV's Client-go usually manages startTS internally.
-	// If readTs > 0, we might need a specific TiKV API to set it.
+func (t *tikvDB) AllocateStartTs() uint64 {
 	txn, err := t.client.Begin()
 	if err != nil {
-		// In our interface, NewTransactionAt doesn't return error.
-		// This is a potential mismatch. For now, panic or handle internally.
-		panic(errors.Wrap(err, "failed to begin tikv transaction"))
+		panic(errors.Wrap(err, "failed to begin tikv transaction in AllocateStartTs"))
 	}
+	ts := txn.StartTS()
+	tikvTxns.Store(ts, txn)
+	return ts
+}
+
+func (t *tikvDB) NewTransactionAt(readTs uint64, update bool) KVTxn {
 	if update {
-		txn.SetPessimistic(true)
+		if v, ok := tikvTxns.LoadAndDelete(readTs); ok {
+			return &tikvTxn{txn: v.(*transaction.KVTxn)}
+		}
+	}
+	txn, err := t.client.Begin()
+	if err != nil {
+		panic(errors.Wrap(err, "failed to begin tikv transaction in NewTransactionAt"))
 	}
 	return &tikvTxn{txn: txn}
 }
@@ -311,12 +318,12 @@ func (tx *tikvTxn) SetWithMeta(key, val []byte, meta byte) error {
 	buf[1] = 0 // Reserved
 	copy(buf[2:], val)
 
-	if tx.txn.IsPessimistic() {
-		// Lock the key first in pessimistic mode to ensure queuing
-		if err := tx.txn.LockKeys(context.Background(), &kv.LockCtx{}, key); err != nil {
-			return err
-		}
-	}
+	// if tx.txn.IsPessimistic() {
+	// 	// Lock the key first in pessimistic mode to ensure queuing
+	// 	if err := tx.txn.LockKeys(context.Background(), &kv.LockCtx{}, key); err != nil {
+	// 		return err
+	// 	}
+	// }
 
 	return tx.txn.Set(key, buf)
 }
@@ -372,7 +379,8 @@ func (tx *tikvTxn) NewIterator(opt KVIterOpts) KVIterator {
 }
 
 func (tx *tikvTxn) LockKeys(ctx context.Context, keys ...[]byte) error {
-	return tx.txn.LockKeys(ctx, &kv.LockCtx{}, keys...)
+	// return tx.txn.LockKeys(ctx, &kv.LockCtx{}, keys...)
+	return nil
 }
 
 type tikvItem struct {

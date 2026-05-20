@@ -102,6 +102,10 @@ func (b *badgerDB) GetTimestamp(ctx context.Context) (uint64, error) {
 	return GetNextTs(), nil
 }
 
+func (b *badgerDB) AllocateStartTs() uint64 {
+	return GetNextTs()
+}
+
 type badgerStreamWriter struct {
 	sw *badger.StreamWriter
 }

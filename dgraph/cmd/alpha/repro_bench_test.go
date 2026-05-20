@@ -4,8 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/dgraph-io/dgraph/v25/embeding"
-	"github.com/tikv/client-go/v2/txnkv"
 	"os"
 	"runtime"
 	"runtime/pprof"
@@ -13,6 +11,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/dgraph-io/dgraph/v25/embeding"
+	"github.com/tikv/client-go/v2/txnkv"
 
 	"github.com/dgraph-io/dgo/v250"
 	"github.com/dgraph-io/dgo/v250/protos/api"
@@ -82,8 +83,8 @@ func BenchmarkDgraphIssueRepro(b *testing.B) {
 	_, err = s.Alter(ctx, &api.Operation{Schema: schemaDsl})
 	x.Check(err)
 
-	concurrency := 10
-	batchSize := 1000
+	concurrency := 100
+	batchSize := 100
 	totalRows := 10000
 
 	// 预生成所有批次的数据，避免 Marshal 开销影响计时
@@ -175,22 +176,22 @@ func BenchmarkQueryTikv(b *testing.B) {
 	defer cleanup()
 	s := &edgraph.Server{}
 	q := `
-{query(func: eq(_TestUser, true)) {
+{query(func: has(TestUser.name)) {
 			count(uid)
 		}}
 `
-	//	q := `
-	//{query(func: eq(_TestUser, true), first: 10) {
-	//			count(uid)
-	//			uid
-	//			TestUser.name
-	//			TestUser.email
-	//			TestUser.birthday
-	//			TestUser.sex
-	//			TestUser.avatar
-	//			TestUser.hobby
-	//		}}
-	//`
+	q = `
+	{query(func: eq(_TestUser, true), first: 10) {
+				count(uid)
+				uid
+				TestUser.name
+				TestUser.email
+				TestUser.birthday
+				TestUser.sex
+				TestUser.avatar
+				TestUser.hobby
+			}}
+	`
 
 	resp, err := s.QueryNoGrpc(context.TODO(), &api.Request{
 		Query: q,

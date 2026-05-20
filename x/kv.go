@@ -7,24 +7,127 @@ package x
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 
 	"github.com/dgraph-io/badger/v4"
 	"github.com/dgraph-io/badger/v4/pb"
 	"github.com/dgraph-io/ristretto/v2/z"
+	"github.com/golang/glog"
 )
 
 var (
 	tsCounter  uint64 = 100
+	tsMax      uint64 = 0
+	tsMu       sync.Mutex
+	tsLeaser   func() (uint64, uint64, error)
 	uidCounter uint64 = 100
+	uidMax     uint64 = 0
+	uidMu      sync.Mutex
+	uidLeaser  func() (uint64, uint64, error)
 )
 
+func SetUidLeaser(f func() (uint64, uint64, error)) {
+	uidMu.Lock()
+	defer uidMu.Unlock()
+	uidLeaser = f
+}
+
+func SetTsLeaser(f func() (uint64, uint64, error)) {
+	tsMu.Lock()
+	defer tsMu.Unlock()
+	tsLeaser = f
+}
+
 func GetNextTs() uint64 {
-	return atomic.AddUint64(&tsCounter, 1)
+	for {
+		cur := atomic.LoadUint64(&tsCounter)
+		max := atomic.LoadUint64(&tsMax)
+		if cur < max {
+			if atomic.CompareAndSwapUint64(&tsCounter, cur, cur+1) {
+				return cur + 1
+			}
+			continue
+		}
+
+		if tsLeaser == nil {
+			return atomic.AddUint64(&tsCounter, 1)
+		}
+
+		tsMu.Lock()
+		cur = atomic.LoadUint64(&tsCounter)
+		max = atomic.LoadUint64(&tsMax)
+		if cur >= max {
+			start, end, err := tsLeaser()
+			if err == nil {
+				atomic.StoreUint64(&tsCounter, start)
+				atomic.StoreUint64(&tsMax, end)
+			} else {
+				glog.Errorf("Failed to renew TS lease: %v", err)
+				val := atomic.AddUint64(&tsCounter, 1)
+				tsMu.Unlock()
+				return val
+			}
+		}
+		tsMu.Unlock()
+	}
+}
+
+func SetNextTsRange(start, end uint64) {
+	tsMu.Lock()
+	defer tsMu.Unlock()
+	atomic.StoreUint64(&tsCounter, start)
+	atomic.StoreUint64(&tsMax, end)
+	glog.Infof("TS range leased: [%d, %d]", start, end)
 }
 
 func GetNextUid() uint64 {
-	return atomic.AddUint64(&uidCounter, 1)
+	for {
+		cur := atomic.LoadUint64(&uidCounter)
+		max := atomic.LoadUint64(&uidMax)
+		if cur < max {
+			if atomic.CompareAndSwapUint64(&uidCounter, cur, cur+1) {
+				return cur + 1
+			}
+			continue
+		}
+
+		if uidLeaser == nil {
+			return atomic.AddUint64(&uidCounter, 1)
+		}
+
+		uidMu.Lock()
+		cur = atomic.LoadUint64(&uidCounter)
+		max = atomic.LoadUint64(&uidMax)
+		if cur >= max {
+			start, end, err := uidLeaser()
+			if err == nil {
+				atomic.StoreUint64(&uidCounter, start)
+				atomic.StoreUint64(&uidMax, end)
+			} else {
+				glog.Errorf("Failed to renew UID lease: %v", err)
+				val := atomic.AddUint64(&uidCounter, 1)
+				uidMu.Unlock()
+				return val
+			}
+		}
+		uidMu.Unlock()
+	}
+}
+
+func SetNextUid(val uint64) {
+	uidMu.Lock()
+	defer uidMu.Unlock()
+	atomic.StoreUint64(&uidCounter, val)
+	atomic.StoreUint64(&uidMax, val) // Just a base
+}
+
+func SetNextUidRange(start, end uint64) {
+	uidMu.Lock()
+	defer uidMu.Unlock()
+	atomic.StoreUint64(&uidCounter, start)
+	atomic.StoreUint64(&uidMax, end)
+	glog.Infof("UID range leased: [%d, %d]", start, end)
 }
 
 var ErrKeyNotFound = badger.ErrKeyNotFound
@@ -72,6 +175,7 @@ type KVDB interface {
 	Subscribe(ctx context.Context, cb func(*pb.KVList) error, matches []pb.Match) error
 	CacheMaxCost(badger.CacheType, int64) (int64, error)
 	GetTimestamp(ctx context.Context) (uint64, error)
+	AllocateStartTs() uint64
 }
 
 // KVStreamWriter is the interface for bulk loading data.

@@ -7,9 +7,11 @@ package worker
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"math"
 	"os"
+	"time"
 
 	"github.com/golang/glog"
 
@@ -109,8 +111,6 @@ func (s *ServerState) InitStorage() {
 		// Postings directory
 		// All the writes to posting store should be synchronous. We use batched writers
 		// for posting lists, so the cost of sync writes is amortized.
-		x.WorkerConfig.TiKVAddrs = []string{"127.0.0.1:2379"}
-		fmt.Println("+++++++++++++++", x.WorkerConfig.TiKVAddrs)
 		if len(x.WorkerConfig.TiKVAddrs) > 0 {
 			glog.Infof("Opening postings TiKV with PD addresses: %v\n", x.WorkerConfig.TiKVAddrs)
 			var err error
@@ -144,7 +144,98 @@ func (s *ServerState) InitStorage() {
 
 	s.gcCloser = z.NewCloser(3)
 	go x.RunVlogGC(s.Pstore, s.gcCloser)
-	// Commenting this out because Badger is doing its own cache checks.
+
+	// Initialize uidCounter using a distributed lease from storage
+	leaseUIDs := func() (uint64, uint64, error) {
+		leaseKey := []byte("_dgraph_uid_lease_")
+		var start, end uint64
+		err := x.RetryUntilSuccess(10, time.Second, func() error {
+			_, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			txn := s.Pstore.NewTransactionAt(math.MaxUint64, true)
+			defer txn.Discard()
+
+			item, err := txn.Get(leaseKey)
+			var currentMax uint64
+			if err == x.ErrKeyNotFound {
+				currentMax = 100
+			} else if err != nil {
+				return err
+			} else {
+				val, _ := item.ValueCopy(nil)
+				currentMax = binary.BigEndian.Uint64(val)
+			}
+
+			newMax := currentMax + 1000000
+			buf := make([]byte, 8)
+			binary.BigEndian.PutUint64(buf, newMax)
+
+			if err := txn.Set(leaseKey, buf); err != nil {
+				return err
+			}
+			if err := txn.CommitAt(math.MaxUint64, nil); err != nil {
+				return err
+			}
+			start, end = currentMax, newMax
+			return nil
+		})
+		return start, end, err
+	}
+
+	// Initialize tsCounter using a distributed lease from storage
+	leaseTS := func() (uint64, uint64, error) {
+		leaseKey := []byte("_dgraph_ts_lease_")
+		var start, end uint64
+		err := x.RetryUntilSuccess(10, time.Second, func() error {
+			_, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			txn := s.Pstore.NewTransactionAt(math.MaxUint64, true)
+			defer txn.Discard()
+
+			item, err := txn.Get(leaseKey)
+			var currentMax uint64
+			if err == x.ErrKeyNotFound {
+				currentMax = 100
+			} else if err != nil {
+				return err
+			} else {
+				val, _ := item.ValueCopy(nil)
+				currentMax = binary.BigEndian.Uint64(val)
+			}
+
+			newMax := currentMax + 10000
+			buf := make([]byte, 8)
+			binary.BigEndian.PutUint64(buf, newMax)
+
+			if err := txn.Set(leaseKey, buf); err != nil {
+				return err
+			}
+			if err := txn.CommitAt(math.MaxUint64, nil); err != nil {
+				return err
+			}
+			start, end = currentMax, newMax
+			return nil
+		})
+		return start, end, err
+	}
+
+	// Register UID leaser for both Badger and TiKV.
+	x.SetUidLeaser(leaseUIDs)
+	uStart, uEnd, err := leaseUIDs()
+	x.Checkf(err, "Error while leasing UID range from storage")
+	x.SetNextUidRange(uStart, uEnd)
+
+	if len(x.WorkerConfig.TiKVAddrs) == 0 {
+		// Register TS leaser only for Badger.
+		// TiKV uses PD for timestamps.
+		x.SetTsLeaser(leaseTS)
+		tStart, tEnd, err := leaseTS()
+		x.Checkf(err, "Error while leasing TS range from storage")
+		x.SetNextTsRange(tStart, tEnd)
+	}
+
 	// go x.MonitorCacheHealth(s.Pstore, s.gcCloser)
 	go x.MonitorDiskMetrics("postings_fs", Config.PostingDir, s.gcCloser)
 }
@@ -166,6 +257,14 @@ func (s *ServerState) GetTimestamp(readOnly bool) uint64 {
 		// Fallback to local counter if KV doesn't support global TS
 		ts = x.GetNextTs()
 	}
+	// We need to update MaxAssigned so that queries/mutations don't hang in WaitForTs.
+	// TODO: For better visibility guarantees, this should be managed more carefully.
+	posting.Oracle().SetMaxAssigned(ts)
+	return ts
+}
+
+func (s *ServerState) AllocateStartTs() uint64 {
+	ts := s.Pstore.AllocateStartTs()
 	posting.Oracle().SetMaxAssigned(ts)
 	return ts
 }
